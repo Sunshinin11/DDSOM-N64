@@ -1,0 +1,47 @@
+# Interactive builds and benchmarks never share ROM or main-object names.
+BUILD_DIR = build/test
+include $(N64_INST)/include/n64.mk
+R := ..
+PROFILE ?= 0
+BENCH_FRAMES ?= 0
+NATIVE_AUDIO ?= 0
+VIDEO_OPT ?= Os
+ROM_NAME := $(if $(filter 0,$(BENCH_FRAMES)),ddsom_native_playtest,ddsom_bench_$(PROFILE))
+GEN ?= $(R)/work/ddsom/n64nt
+GENSOUND := $(R)/work/ddsom/n64soundtest
+N64_CXXFLAGS += -std=gnu++20 -Os -DCPS2RECOMP_N64 -DDDSOM_SOUND_115=1 -DDDSOM_NATIVE_BOARD=1 -DDDSOM_NATIVE_TIME=1 -fno-exceptions -Wno-error -fno-strict-aliasing -I$(R)/runtime -I$(R)/machine -I$(GEN)
+N64_CFLAGS += -Wno-error
+CORE := $(R)/machine/m68k.cpp $(R)/machine/eeprom.cpp $(R)/runtime/recomp.cpp $(R)/runtime/game.cpp $(R)/runtime/no_game.cpp
+GENSRC := $(wildcard $(GEN)/native_*.cpp)
+NATIVE_SRCS := $(if $(filter 1,$(NATIVE_AUDIO)),audio_native.cpp sound_ei.cpp $(R)/sound/z80.cpp $(R)/runtime/recomp_z80.cpp $(wildcard $(GENSOUND)/z80_*.cpp))
+SRCS := audio.cpp profile.cpp $(NATIVE_SRCS) save.cpp board.cpp rom_cache.cpp $(CORE) $(GENSRC)
+RDP_OBJ := $(BUILD_DIR)/rdp_video_$(VIDEO_OPT).o
+MAIN_OBJ := $(BUILD_DIR)/main_p$(PROFILE)_b$(BENCH_FRAMES).o
+SELECT_OBJ := $(BUILD_DIR)/audio_select_n$(NATIVE_AUDIO).o
+OBJS := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(notdir $(SRCS))) $(MAIN_OBJ) $(SELECT_OBJ) $(RDP_OBJ)
+vpath %.cpp . $(R)/machine $(R)/runtime $(R)/sound $(GEN) $(GENSOUND)
+all: $(ROM_NAME).z64
+.DEFAULT_GOAL := all
+FS ?= $(if $(filter 1,$(NATIVE_AUDIO)),$(R)/work/ddsom/n64fs_test,$(R)/work/ddsom/n64fs_native)
+N64_MKDFS_ROOT = $(FS)
+$(BUILD_DIR)/$(ROM_NAME).dfs: $(shell find $(FS) -type f)
+$(BUILD_DIR)/$(ROM_NAME).elf: $(OBJS)
+$(ROM_NAME).z64: N64_ROM_TITLE = "DDSOM Native Test"
+$(ROM_NAME).z64: N64_ROM_SAVETYPE = eeprom4k
+$(ROM_NAME).z64: $(BUILD_DIR)/$(ROM_NAME).dfs
+$(RDP_OBJ): rdp_video.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) -c $(CXXFLAGS) -$(VIDEO_OPT) -o $@ $<
+$(MAIN_OBJ): main.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) -c $(CXXFLAGS) -DDDSOM_PROFILE=$(PROFILE) -DDDSOM_BENCH_FRAMES=$(BENCH_FRAMES) -o $@ $<
+$(SELECT_OBJ): audio_select.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) -c $(CXXFLAGS) -DDDSOM_WITH_NATIVE_AUDIO=$(NATIVE_AUDIO) -o $@ $<
+$(OBJS): Makefile.test
+-include $(OBJS:.o=.d)
+$(BUILD_DIR)/recomp.o $(BUILD_DIR)/rom_cache.o: N64_CXXFLAGS += -O2
+$(BUILD_DIR)/audio_native.o $(BUILD_DIR)/sound_ei.o $(BUILD_DIR)/recomp_z80.o $(BUILD_DIR)/z80.o $(filter $(BUILD_DIR)/z80_%,$(OBJS)) $(BUILD_DIR)/native_004.o $(BUILD_DIR)/m68k.o: N64_CXXFLAGS += -O2 -flto
+.PHONY: all
+
+

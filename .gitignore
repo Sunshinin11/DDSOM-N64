@@ -1,0 +1,52 @@
+# Python / OS caches
+__pycache__/
+*.pyc
+.DS_Store
+
+# Build and generated directories
+build/
+/work
+work/
+port_n64/build/
+
+# ROMs, saves, logs, and N64 build outputs
+*.z64
+*.v64
+*.n64
+*.elf
+*.dfs
+*.map
+*.sym
+*.stripped
+*.tmp
+*.o
+*.d
+*.eeprom
+*.state
+*.sav
+*.eep
+*.nv
+*.log
+*.tgz
+
+# Never commit game data or assets derived from ROMs
+rom/
+*.zip
+*.7z
+*.rar
+*.key
+*.bin
+*.lst
+*.wav
+*.wav64
+state*.bin
+frame_data.csv
+
+# Generated C++ translation units (if produced outside work/)
+native_[0-9]*.cpp
+native_table.cpp
+native_decl.h
+z80_[0-9]*.cpp
+z80_table.cpp
+z80_decl.h
+game_info.h

@@ -1,0 +1,6 @@
+# Preserve exact line endings for entry tables and upstream headers
+port_n64/native_entries.txt -text
+machine/m68k.h -text
+*.sh text eol=lf
+Makefile* text eol=lf
+
