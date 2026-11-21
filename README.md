@@ -36,12 +36,12 @@ Arquivos necessários da ROM (versão europeia `ddsom`, 21 arquivos colocados em
 - Áudio WAV64 processado no mixer do RSP.
 - Salvamento de configuração e dados em EEPROM 4K.
 
-## Desempenho atual (Ares v148)
+## Desempenho atual
 
+- **No Nintendo 64 real (console com Expansion Pak) o jogo roda mais rápido que no emulador Ares; os números abaixo, medidos no Ares v148, são portanto o piso, e no console o desempenho é superior.**
 - O jogo original foi projetado para 60 FPS e esse é o alvo do port.
-- Combate: lógica em cerca de 59 a 60 quadros por segundo (~9 ms por quadro), tela entre ~51 e 58 FPS; média da rota de medição em torno de 50 FPS de tela.
-- Ponto ainda lento: a entrada dos 5 heróis no início da fase 1 (cai para ~20 a 35 FPS por alguns segundos).
-- Console real: o desempenho desta versão ainda não foi medido em hardware real.
+- Combate (Ares v148): lógica em cerca de 59 a 60 quadros por segundo (~9 ms por quadro), tela entre ~51 e 58 FPS; média da rota de medição em torno de 50 FPS de tela.
+- Ponto ainda lento (Ares v148): a entrada dos 5 heróis no início da fase 1 (cai para ~20 a 35 FPS por alguns segundos).
 
 ## Requisitos
 
@@ -130,12 +130,12 @@ Required ROM files (European release `ddsom`, 21 files placed in `rom/ddsom/`):
 - WAV64 audio playback processed on the RSP mixer.
 - Game saves stored in 4K EEPROM.
 
-## Current performance (Ares v148)
+## Current performance
 
+- **On a real Nintendo 64 (console with Expansion Pak), the game runs faster than on the Ares emulator; the numbers below, measured on Ares v148, are therefore the floor, and on console performance is superior.**
 - The original game was built for 60 FPS, which is the target of this port.
-- Combat: logic runs at ~59 to 60 FPS (~9 ms per frame); screen presentation runs between ~51 and 58 FPS; average across benchmark route is ~50 FPS.
-- Known bottleneck: the 5 heroes entry sequence at the start of stage 1 drops to ~20 to 35 FPS for a few seconds.
-- Real console performance has not yet been measured on this build.
+- Combat (Ares v148): logic runs at ~59 to 60 FPS (~9 ms per frame); screen presentation runs between ~51 and 58 FPS; average across benchmark route is ~50 FPS.
+- Known bottleneck (Ares v148): the 5 heroes entry sequence at the start of stage 1 drops to ~20 to 35 FPS for a few seconds.
 
 ## Requirements
 
