@@ -43,25 +43,25 @@ namespace {
             size_t lo = 0, hi = kNativeCode.entryCount;
             while (lo < hi) {
                 const size_t mid = (lo + hi) / 2;
-                if (kNativeCode.entries[mid].address < pc) {
+                if (kNativeCode.addresses[mid] < pc) {
                     lo = mid + 1;
                 } else {
                     hi = mid;
                 }
             }
-            return lo < kNativeCode.entryCount && kNativeCode.entries[lo].address == pc ? kNativeCode.entries[lo].fn : nullptr;
+            return lo < kNativeCode.entryCount && kNativeCode.addresses[lo] == pc ? kNativeCode.Fn(lo) : nullptr;
         }
         static bool SearchInside(uint32_t pc) {
-            size_t lo = 0, hi = kNativeCode.rangeCount;
+            size_t lo = 0, hi = kNativeCode.entryCount;
             while (lo < hi) {
                 const size_t mid = (lo + hi) / 2;
-                if (kNativeCode.ranges[mid].start <= pc) {
+                if (kNativeCode.addresses[mid] <= pc) {
                     lo = mid + 1;
                 } else {
                     hi = mid;
                 }
             }
-            return lo > 0 && pc < kNativeCode.ranges[lo - 1].end;
+            return lo > 0 && pc < kNativeCode.End(lo - 1);
         }
         Slot &Get(uint32_t pc) const {
             Slot &slot = slots[(pc >> 1) & (kSlots - 1)];
@@ -96,19 +96,16 @@ namespace {
         std::vector<uint8_t> covered;
         uint32_t limit = 0; // addresses below this are in the tables
         Tables() {
-            for (size_t n = 0; n < kNativeCode.rangeCount; n++) {
-                limit = std::max(limit, kNativeCode.ranges[n].end);
-            }
             for (size_t n = 0; n < kNativeCode.entryCount; n++) {
-                limit = std::max(limit, kNativeCode.entries[n].address + 2);
+                limit = std::max(limit, std::max(kNativeCode.End(n), kNativeCode.Address(n) + 2));
             }
             fn.assign(limit / 2 + 1, nullptr);
             covered.assign(limit / 2 + 1, 0);
             for (size_t n = 0; n < kNativeCode.entryCount; n++) {
-                fn[kNativeCode.entries[n].address / 2] = kNativeCode.entries[n].fn;
+                fn[kNativeCode.Address(n) / 2] = kNativeCode.Fn(n);
             }
-            for (size_t n = 0; n < kNativeCode.rangeCount; n++) {
-                for (uint32_t at = kNativeCode.ranges[n].start; at < kNativeCode.ranges[n].end; at += 2) {
+            for (size_t n = 0; n < kNativeCode.entryCount; n++) {
+                for (uint32_t at = kNativeCode.Address(n); at < kNativeCode.End(n); at += 2) {
                     covered[at / 2] = 1;
                 }
             }
@@ -159,7 +156,9 @@ namespace {
         static std::vector<Hook> hooks;
         return hooks;
     }
+#ifndef CPS2RECOMP_N64
     std::vector<uint16_t> g_hooked; // by address / 2: the hook's number + 1
+#endif
     bool g_hooksChecked = false;
 
     // Translated code only stops by at the hooks the translator knew of
@@ -192,14 +191,29 @@ void AddHook(uint32_t address, const char *name, HookFn fn) {
         fprintf(stderr, "more than %d hooks\n", 0xFFFF);
         abort();
     }
+#ifndef CPS2RECOMP_N64
     if (g_hooked.size() <= address / 2) {
         g_hooked.resize(address / 2 + 1, 0);
     }
     g_hooked[address / 2] = static_cast<uint16_t>(Hooks().size());
+#endif
+}
+
+static unsigned HookIndex(uint32_t address) {
+#ifdef CPS2RECOMP_N64
+    // Only a few hooks are registered on N64, and their ROM addresses can be far apart.
+    const auto &hooks = Hooks();
+    for (unsigned i = hooks.size(); i > 0; --i) {
+        if (hooks[i - 1].address == address) return i;
+    }
+    return 0;
+#else
+    return address / 2 < g_hooked.size() && !(address & 1) ? g_hooked[address / 2] : 0;
+#endif
 }
 
 bool HasHook(uint32_t address) {
-    return address / 2 < g_hooked.size() && !(address & 1) && g_hooked[address / 2];
+    return HookIndex(address) != 0;
 }
 
 namespace {
@@ -403,7 +417,8 @@ void Call(M68K &c, uint32_t address) {
 }
 
 bool RunHook(M68K &c, uint32_t address) {
-    if (!HasHook(address) || g_inOriginal) {
+    const unsigned index = HookIndex(address);
+    if (!index || g_inOriginal) {
         return false;
     }
 #ifdef CPS2RECOMP_CHECK
@@ -411,7 +426,7 @@ bool RunHook(M68K &c, uint32_t address) {
         return false; // (the run loop has asked the hook already)
     }
 #endif
-    Hook &hook = Hooks()[g_hooked[address / 2] - 1];
+    Hook &hook = Hooks()[index - 1];
     // (the port's own code takes none of the 68000's time for the board's waits: a hook only looks, and a rewrite
     // charges what it says)
     struct NoWaits {
@@ -472,7 +487,7 @@ uint32_t BenchDispatch68k(uint32_t n) {
     const uint64_t t0 = get_ticks_us();
     for (uint32_t k = 0; k < n; k++) {
         // (enderecos espalhados pelo programa, como os blocos do jogo)
-        const uint32_t pc = kNativeCode.entries[(k * 7919u) % kNativeCode.entryCount].address;
+        const uint32_t pc = kNativeCode.addresses[(k * 7919u) % kNativeCode.entryCount];
         sink += reinterpret_cast<uintptr_t>(Tables::SearchAt(pc)); // (a busca em si, sem o cache)
         (void)tables;
     }
@@ -510,7 +525,7 @@ void M68K::CallGuest(uint32_t address) {
             fprintf(stderr, "the game's routine at %06X, called from C++, did not come back (it must not wait for anything)\n", address);
             exit(1);
         }
-        if (!g_hooked.empty() && RunHook(*this, pc)) {
+        if (!Hooks().empty() && RunHook(*this, pc)) {
             continue;
         }
 #ifndef CPS2RECOMP_CHECK
@@ -597,7 +612,7 @@ void M68K::Run(uint64_t until, Mode mode) {
                 continue;
             }
         }
-        if (ownHooked ? OwnHook(pc) : !g_hooked.empty() && RunHook(*this, pc)) {
+        if (ownHooked ? OwnHook(pc) : !Hooks().empty() && RunHook(*this, pc)) {
             continue;
         }
 #ifdef CPS2RECOMP_N64
@@ -742,7 +757,7 @@ void M68K::RunChecked(uint64_t until) {
             cycles = until;
             return;
         }
-        if (!g_hooked.empty() && RunHook(*this, pc)) {
+        if (!Hooks().empty() && RunHook(*this, pc)) {
             continue;
         }
         const NativeFn fn = tables.At(pc);

@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: GPL-3.0-only
 # Copyright (C) 2026 Tommy McLeroy. Part of cps2recomp.
 
+import sys
+
 """The 68000's instructions, decoded for the translator (recomp.py) and the disassembler (m68kdis.py).
 
 decode(mem, addr) gives an Insn: its length, where control goes after it, which flags it reads and sets,
@@ -12,6 +14,12 @@ interpreter (Insn.interp): the translated code calls it for that one instruction
 X, N, Z, V, C = 16, 8, 4, 2, 1
 NZVC = N | Z | V | C
 ALL = X | NZVC
+
+
+def flags_of(live):
+    """The N Z V C flags an emitter has to set: `live` is the translator's mask of the flags wanted after the
+    instruction (or True: all of them)."""
+    return NZVC if live is True else (live & NZVC)
 
 MASK = (0xFF, 0xFFFF, 0xFFFFFFFF)
 BYTES = (1, 2, 4)
@@ -155,6 +163,8 @@ class Ea:
         if self.kind == "a":
             return "c.a[%d]" % self.reg if size == 2 else "(c.a[%d] & 0x%X)" % (self.reg, MASK[size])
         if self.kind == "m":
+            if size < 2 and self.const in (0x804000, 0x804001, 0x804010, 0x804011, 0x804020, 0x804021):
+                return "Joypad%d(c, %s)" % (BYTES[size] * 8, self.var)
             return "R%d(c, %s)" % (BYTES[size] * 8, self.var)
         if self.kind == "p":
             return "P%d(c, %s)" % (BYTES[size] * 8, self.var)
@@ -243,7 +253,9 @@ def _decode(insn, dec, op):
         return OPERAND_CYCLES[1 if sz == 2 else 0][mi if index is None else index]
 
     def logic(expr, sz):
-        return "c.Logic(%s, %d);" % (expr, sz)
+        # (the flags wanted after the instruction: `live` of the emitter that calls this, a mask of N Z V C;
+        # True/ALL when the translator does not tell them apart)
+        return "c.LogicF<%d>(%s, %d);" % (flags_of(sys._getframe(1).f_locals.get("live", ALL)), expr, sz)
 
     if group == 0:
         if op & 0x0100 and mode == 1:
@@ -349,7 +361,7 @@ def _decode(insn, dec, op):
                 else:
                     lines += ea.store("target %s %s" % (sign, v))
             elif live:
-                lines.append("c.Sub(target, %s, %d, false, false, false);" % (v, size))
+                lines.append("c.CmpF<%d>(target, %s, %d);" % (flags_of(live), v, size))
             else:
                 lines.append("(void)target;")
             return lines + [cyc(cycles)]
@@ -818,7 +830,7 @@ def _decode(insn, dec, op):
             cycles = 6 + opc(sz)
             insn.emit = lambda live: ea.pre + [
                 "const uint32_t value = %s;" % (ea.load() if sz == 2 else "S16(%s)" % ea.load()),
-                "c.Sub(c.a[%d], value, 2, false, false, false);" % reg2 if live else "(void)value;", cyc(cycles)]
+                "c.CmpF<%d>(c.a[%d], value, 2);" % (flags_of(live), reg2) if live else "(void)value;", cyc(cycles)]
             return
         if not op & 0x0100:
             ea = dec.ea(mode, reg, size)
@@ -829,7 +841,7 @@ def _decode(insn, dec, op):
             cycles = opc(size) + (6 if size == 2 else 4)
             insn.emit = lambda live: ea.pre + [
                 "const uint32_t value = %s;" % ea.load(),
-                "c.Sub(c.d[%d], value, %d, false, false, false);" % (reg2, size) if live else "(void)value;", cyc(cycles)]
+                "c.CmpF<%d>(c.d[%d], value, %d);" % (flags_of(live), reg2, size) if live else "(void)value;", cyc(cycles)]
             return
         if mode == 1:
             src, dst = dec.ea(3, reg, size), dec.ea(3, reg2, size)
@@ -838,7 +850,7 @@ def _decode(insn, dec, op):
             # (as the interpreter: the first operand is read before the second's register steps)
             insn.emit = lambda live: src.pre + ["const uint32_t x = %s;" % src.load()] + dst.pre + [
                 "const uint32_t y = %s;" % dst.load(),
-                "c.Sub(y, x, %d, false, false, false);" % size if live else "(void)x, (void)y;",
+                "c.CmpF<%d>(y, x, %d);" % (flags_of(live), size) if live else "(void)x, (void)y;",
                 cyc(20 if size == 2 else 12)]
             return
         ea = dec.ea(mode, reg, size)

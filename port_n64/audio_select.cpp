@@ -4,6 +4,17 @@
 #ifndef DDSOM_WITH_NATIVE_AUDIO
 #define DDSOM_WITH_NATIVE_AUDIO 1
 #endif
+namespace {
+unsigned submittedAudioBuffers = 0;
+unsigned productiveAudioPolls = 0;
+}
+
+extern "C" void __real_audio_write_end();
+extern "C" void __wrap_audio_write_end() {
+    __real_audio_write_end();
+    ++submittedAudioBuffers;
+}
+
 namespace ddsom {
 void RecordedAudioInit();void RecordedAudioRequest(const uint8_t*);void RecordedAudioPoll();void RecordedAudioReport();
 void NativeAudioInit();void NativeAudioRequest(const uint8_t*);void NativeAudioPoll();void NativeAudioReport();
@@ -27,14 +38,17 @@ else if(g_options.audio==AudioMode::NativeDriver)NativeAudioRequest(r);
 void AudioPoll(){if(g_options.audio==AudioMode::Silent)return;
  // (the callers poll far more often than the audio needs, a buffer is some 20 ms: no more than a poll a millisecond)
  static uint32_t last=0;const uint32_t now=TICKS_READ();if(last&&now-last<TICKS_FROM_US(1000))return;last=now;
+ const unsigned before = submittedAudioBuffers;
  Measure m;if(g_options.audio==AudioMode::Recorded)RecordedAudioPoll();
 #if DDSOM_WITH_NATIVE_AUDIO
 else NativeAudioPoll();
 #endif
+ if (submittedAudioBuffers != before) ++productiveAudioPolls;
 }
 void AudioReport(){if(g_options.audio==AudioMode::Recorded)RecordedAudioReport();
 #if DDSOM_WITH_NATIVE_AUDIO
 else if(g_options.audio==AudioMode::NativeDriver)NativeAudioReport();
 #endif
-debugf("[DDSOM_AUDIO_TOTAL] us=%llu\n",(unsigned long long)TICKS_TO_US(spent));}
+debugf("[DDSOM_AUDIO_TOTAL] us=%llu productive_polls=%u submitted_buffers=%u\n",
+       (unsigned long long)TICKS_TO_US(spent), productiveAudioPolls, submittedAudioBuffers);}
 }

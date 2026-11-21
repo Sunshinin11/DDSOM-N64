@@ -1,7 +1,2 @@
-# Default build keeps ddsom_native_playtest.z64 as the single output.
+# Default build keeps ddsom.z64 intact and produces the interactive playtest.
 include Makefile.test
-
-prepare:
-	python3 prepare_assets.py --n64-inst $(N64_INST)
-
-.PHONY: prepare

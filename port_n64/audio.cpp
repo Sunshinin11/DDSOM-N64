@@ -31,7 +31,7 @@ Cached* Wave(uint16_t file){
  }
  if(!best)return nullptr;
  char path[32];snprintf(path,sizeof path,"rom:/snd/s%04X.wav64",file);
- FILE*f=fopen(path,"rb");if(!f)return nullptr;fclose(f);
+ if(!dfs_rom_addr(path+5))return nullptr;
  if(best->open)wav64_close(&best->wave);
  wav64_open(&best->wave,path);best->file=file;best->open=true;best->used=serial;opens++;return best;
 }

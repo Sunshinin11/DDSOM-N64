@@ -5,27 +5,36 @@ R := ..
 PROFILE ?= 0
 BENCH_FRAMES ?= 0
 NATIVE_AUDIO ?= 0
-VIDEO_OPT ?= Os
-ROM_NAME := $(if $(filter 0,$(BENCH_FRAMES)),ddsom_native_playtest,ddsom_bench_$(PROFILE))
+VIDEO_OPT ?= O2
+# HUD=1: painel de tempos na tela para medir no console (R esconde sprites, C-cima esconde cenarios)
+HUD ?= 0
+ROM_NAME := $(if $(filter 0,$(BENCH_FRAMES)),$(if $(filter 1,$(HUD)),ddsom_native_hud,ddsom_native_playtest),ddsom_bench_$(PROFILE))
 GEN ?= $(R)/work/ddsom/n64nt
 GENSOUND := $(R)/work/ddsom/n64soundtest
 N64_CXXFLAGS += -std=gnu++20 -Os -DCPS2RECOMP_N64 -DDDSOM_SOUND_115=1 -DDDSOM_NATIVE_BOARD=1 -DDDSOM_NATIVE_TIME=1 -fno-exceptions -Wno-error -fno-strict-aliasing -I$(R)/runtime -I$(R)/machine -I$(GEN)
 N64_CFLAGS += -Wno-error
+N64_LDFLAGS += --wrap=audio_write_end
+# Funcoes quentes juntas e sem conflito no cache de instrucoes do VR4300 (16 KB, mapeamento direto): gerado por tools/hot_layout.py
+HOT_LD ?= hot.ld
+HOT_PAD := $(wildcard hotpad.cpp)
+ifneq ($(wildcard $(HOT_LD)),)
+N64_LDFLAGS += --section-ordering-file=$(HOT_LD)
+endif
 CORE := $(R)/machine/m68k.cpp $(R)/machine/eeprom.cpp $(R)/runtime/recomp.cpp $(R)/runtime/game.cpp $(R)/runtime/no_game.cpp
 GENSRC := $(wildcard $(GEN)/native_*.cpp)
 NATIVE_SRCS := $(if $(filter 1,$(NATIVE_AUDIO)),audio_native.cpp sound_ei.cpp $(R)/sound/z80.cpp $(R)/runtime/recomp_z80.cpp $(wildcard $(GENSOUND)/z80_*.cpp))
-SRCS := audio.cpp profile.cpp $(NATIVE_SRCS) save.cpp board.cpp rom_cache.cpp $(CORE) $(GENSRC)
+SRCS := $(HOT_PAD) audio.cpp profile.cpp $(NATIVE_SRCS) save.cpp board.cpp lift_sprites.cpp rom_cache.cpp $(CORE) $(GENSRC)
 RDP_OBJ := $(BUILD_DIR)/rdp_video_$(VIDEO_OPT).o
-MAIN_OBJ := $(BUILD_DIR)/main_p$(PROFILE)_b$(BENCH_FRAMES).o
+MAIN_OBJ := $(BUILD_DIR)/main_p$(PROFILE)_b$(BENCH_FRAMES)_h$(HUD).o
 SELECT_OBJ := $(BUILD_DIR)/audio_select_n$(NATIVE_AUDIO).o
-OBJS := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(notdir $(SRCS))) $(MAIN_OBJ) $(SELECT_OBJ) $(RDP_OBJ)
+OBJS := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(notdir $(SRCS))) $(MAIN_OBJ) $(SELECT_OBJ) $(RDP_OBJ) $(BUILD_DIR)/rsp_tiles.o
 vpath %.cpp . $(R)/machine $(R)/runtime $(R)/sound $(GEN) $(GENSOUND)
 all: $(ROM_NAME).z64
 .DEFAULT_GOAL := all
 FS ?= $(if $(filter 1,$(NATIVE_AUDIO)),$(R)/work/ddsom/n64fs_test,$(R)/work/ddsom/n64fs_native)
 N64_MKDFS_ROOT = $(FS)
 $(BUILD_DIR)/$(ROM_NAME).dfs: $(shell find $(FS) -type f)
-$(BUILD_DIR)/$(ROM_NAME).elf: $(OBJS)
+$(BUILD_DIR)/$(ROM_NAME).elf: $(OBJS) $(wildcard $(HOT_LD))
 $(ROM_NAME).z64: N64_ROM_TITLE = "DDSOM Native Test"
 $(ROM_NAME).z64: N64_ROM_SAVETYPE = eeprom4k
 $(ROM_NAME).z64: $(BUILD_DIR)/$(ROM_NAME).dfs
@@ -34,14 +43,19 @@ $(RDP_OBJ): rdp_video.cpp
 	$(CXX) -c $(CXXFLAGS) -$(VIDEO_OPT) -o $@ $<
 $(MAIN_OBJ): main.cpp
 	@mkdir -p $(dir $@)
-	$(CXX) -c $(CXXFLAGS) -DDDSOM_PROFILE=$(PROFILE) -DDDSOM_BENCH_FRAMES=$(BENCH_FRAMES) -o $@ $<
+	$(CXX) -c $(CXXFLAGS) -DDDSOM_PROFILE=$(PROFILE) -DDDSOM_BENCH_FRAMES=$(BENCH_FRAMES) -DDDSOM_HUD=$(HUD) $(if $(SAMPLE_FROM),-DDDSOM_SAMPLE_FROM=$(SAMPLE_FROM) -DDDSOM_SAMPLE_TO=$(SAMPLE_TO)) -o $@ $<
 $(SELECT_OBJ): audio_select.cpp
 	@mkdir -p $(dir $@)
 	$(CXX) -c $(CXXFLAGS) -DDDSOM_WITH_NATIVE_AUDIO=$(NATIVE_AUDIO) -o $@ $<
 $(OBJS): Makefile.test
 -include $(OBJS:.o=.d)
-$(BUILD_DIR)/recomp.o $(BUILD_DIR)/rom_cache.o: N64_CXXFLAGS += -O2
-$(BUILD_DIR)/audio_native.o $(BUILD_DIR)/sound_ei.o $(BUILD_DIR)/recomp_z80.o $(BUILD_DIR)/z80.o $(filter $(BUILD_DIR)/z80_%,$(OBJS)) $(BUILD_DIR)/native_004.o $(BUILD_DIR)/m68k.o: N64_CXXFLAGS += -O2 -flto
+$(BUILD_DIR)/recomp.o $(BUILD_DIR)/rom_cache.o $(BUILD_DIR)/board.o $(BUILD_DIR)/lift_sprites.o: N64_CXXFLAGS += -O2
+$(BUILD_DIR)/audio_native.o $(BUILD_DIR)/sound_ei.o $(BUILD_DIR)/recomp_z80.o $(BUILD_DIR)/z80.o $(filter $(BUILD_DIR)/z80_%,$(OBJS)) $(BUILD_DIR)/native_004.o $(BUILD_DIR)/native_048.o $(BUILD_DIR)/m68k.o: N64_CXXFLAGS += -O2 -flto
+# Os arquivos de codigo gerado mais quentes no perfil de combate (port_n64/arquivos_quentes.py): acesso a RAM de
+# trabalho embutido (runtime/native.h, DDSOM_FAST_RAM); os outros continuam como estao, para o executavel caber na RAM
+# (cada arquivo com a RAM embutida cresce ~55 KB de codigo; com seis, faltou RAM para o cache dos cenarios)
+HOT_NATIVE := $(addprefix $(BUILD_DIR)/,native_023.o native_009.o)
+$(HOT_NATIVE): N64_CXXFLAGS += -DDDSOM_FAST_RAM
 .PHONY: all
 
 

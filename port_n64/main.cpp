@@ -5,7 +5,7 @@
 // (rdp_video.cpp) a partir dos mapas de tiles, da lista de objetos e da paleta que o jogo montou.
 // Os ROMs ficam no cartucho: o programa lido por um cache de paginas (rom_cache.cpp), os graficos em CI4 por DMA.
 // Tela 384x240 (a do CPS-2, 384x224, com 8 linhas em cima e embaixo).
-// Driver de som 1.15 traduzido estaticamente para MIPS; PCM de 16 vozes pelo mixer do RSP.
+// Os comandos de som acionam WAV64 no mixer do RSP.
 // Telemetria [DD_SOM_PERF] no log a cada 60 frames (run_ares.ps1 grava em telemetria.log).
 #include <libdragon.h>
 
@@ -18,7 +18,17 @@
 #ifndef DDSOM_BENCH_FRAMES
 #define DDSOM_BENCH_FRAMES 0
 #endif
+// Log por ISViewer/USB: so nos builds de medicao. Na ROM de jogar fica desligado (num flashcart sem PC o USB
+// atrasa ou trava o jogo) e nada de texto aparece na tela.
+#ifndef DDSOM_LOG
+#define DDSOM_LOG (DDSOM_BENCH_FRAMES > 0)
+#endif
+// Painel de tempos na tela, para medir no console sem USB (e botoes que escondem camadas).
+#ifndef DDSOM_HUD
+#define DDSOM_HUD 0
+#endif
 #include "board.h"
+#include "bench_gameplay.h"
 #include "cart_n64.h"
 #include "perf_n64.h"
 #include "rdp_video.h"
@@ -31,7 +41,7 @@ using namespace cps2recomp;
 
 namespace cps2recomp {
 void RomCacheReport();
-void RomCacheInit(RomCache &c, uint32_t pi, uint32_t size); // (rom_cache.cpp)
+void RomCacheInit(RomCache &c, uint32_t pi, uint32_t size, unsigned slots = RomCache::kSlots); // (rom_cache.cpp)
 void RegisterGame();                                       // (runtime/no_game.cpp)
 }
 
@@ -92,8 +102,10 @@ namespace {
     void Status(const char *text) {
         surface_t *fb = display_get();
         graphics_fill_screen(fb, 0);
+#if DDSOM_LOG || DDSOM_HUD
         graphics_draw_text(fb, 16, 16, "Shadow over Mystara N64");
         graphics_draw_text(fb, 16, 32, text);
+#endif
         display_show(fb);
 
         fprintf(stderr, "%s\n", text);
@@ -103,6 +115,45 @@ namespace {
     void OnVblank() {
         g_vblanks++;
     }
+
+    // RDP em paralelo com a CPU: o quadro vai para o RDP sem esperar; quando ele termina, este callback (na
+    // interrupcao) entrega o quadro a tela. A CPU segue com a logica do quadro seguinte enquanto o RDP desenha.
+    // No console o RDP leva varios ms por quadro (no Ares quase nada): esperado em serie, isso se somava a CPU.
+#if DDSOM_BENCH_FRAMES
+    // Perfil por amostragem do codigo MIPS (so na medicao): um timer a ~10 kHz anota onde a CPU estava (EPC da
+    // interrupcao), em faixas de 64 bytes; no fim, as faixas mais cheias vao para o log (enderecos -> funcoes no PC).
+    constexpr unsigned kSampleSlots = 4096;
+    uint32_t g_sampleKey[kSampleSlots], g_sampleCount[kSampleSlots], g_sampleLost = 0, g_sampleTotal = 0;
+    volatile bool g_sampling = false;
+    void SampleTimer(int) {
+        if (!g_sampling) return;
+        const uint32_t pc = uint32_t(C0_EPC());
+        const uint32_t key = (pc >> 6) | 1u;
+        unsigned at = (key * 2654435761u) >> 20;
+        for (unsigned n = 0; n < 16; n++, at = (at + 1) & (kSampleSlots - 1)) {
+            if (g_sampleKey[at] == key) { g_sampleCount[at]++; g_sampleTotal++; return; }
+            if (!g_sampleKey[at]) { g_sampleKey[at] = key; g_sampleCount[at] = 1; g_sampleTotal++; return; }
+        }
+        g_sampleLost++;
+    }
+    void SampleReport() {
+        debugf("[DDSOM_SAMPLES] total=%lu lost=%lu\n", (unsigned long)g_sampleTotal, (unsigned long)g_sampleLost);
+        for (unsigned k = 0; k < 400; k++) {
+            unsigned best = kSampleSlots;
+            for (unsigned n = 0; n < kSampleSlots; n++)
+                if (g_sampleCount[n] && (best == kSampleSlots || g_sampleCount[n] > g_sampleCount[best])) best = n;
+            if (best == kSampleSlots) break;
+            debugf("[DDSOM_SAMPLE] addr=%08lx count=%lu\n", (unsigned long)((g_sampleKey[best] & ~1u) << 6), (unsigned long)g_sampleCount[best]);
+            g_sampleCount[best] = 0;
+        }
+    }
+#endif
+    volatile uint32_t g_gpuStart = 0, g_gpuTicks = 0, g_gpuFrames = 0;
+    void FrameDone(void *fb) {
+        g_gpuTicks += TICKS_READ() - g_gpuStart;
+        g_gpuFrames++;
+        display_show(static_cast<surface_t *>(fb));
+    }
 } // namespace
 
 int main() {
@@ -110,9 +161,11 @@ int main() {
     ddsom::g_options.accurateVideo=DDSOM_PROFILE!=4;
     ddsom::g_options.videoFastPaths=DDSOM_PROFILE==0||DDSOM_PROFILE>=5;
     ddsom::g_options.save=DDSOM_PROFILE==0||DDSOM_PROFILE==7;
-    g_profileNative=DDSOM_BENCH_FRAMES>0;
+    g_profileNative=false; // (ligado so na janela do amostrador, abaixo)
+#if DDSOM_LOG
     debug_init_isviewer();
     debug_init_usblog();
+#endif
     dfs_init(DFS_DEFAULT_LOCATION);
     resolution_t res = {};
     res.width = 384;
@@ -122,6 +175,7 @@ int main() {
     res.overscan_margin = 0;
     display_init(res, DEPTH_16_BPP, 2, GAMMA_NONE, FILTERS_RESAMPLE);
     rdpq_init();
+    if constexpr (DDSOM_PROFILE == 9) rdpq_debug_start();
     joypad_init();
     register_VI_handler(OnVblank);
     debugf("[DDSOM_BUILD_PROFILE] profile=%d benchmark_frames=%d\n",DDSOM_PROFILE,DDSOM_BENCH_FRAMES);
@@ -129,13 +183,16 @@ int main() {
 
     const CartFile program = Cart("program.bin"), opcodes = Cart("opcodes.bin"), gfx = Cart("gfx.bin");
     static std::vector<uint8_t> empty = Load("empty.bin");
+    assertf(program.pi && opcodes.pi && gfx.pi && empty.size() >= (gfx.size + 255) / 256,
+            "Missing or truncated cartridge resources");
     RomCacheInit(g_romData, program.pi, program.size);
-    RomCacheInit(g_romOpcodes, opcodes.pi, opcodes.size);
+    // (128 paginas = 64 KB: com 32 o cache de opcodes buscava ~8 paginas por quadro no cartucho em combate, ~1,2 ms
+    // de espera de DMA por quadro; a RAM veio do deposito de tiles 16x16, que quase nao errava com 1024)
+    RomCacheInit(g_romOpcodes, opcodes.pi, opcodes.size, 128);
     RdpVideoInit(gfx.pi, gfx.size, empty.data());
 
     ddsom::AudioInit();
     RegisterGame();
-    assertf(program.pi&&opcodes.pi&&gfx.pi&&empty.size()>=(gfx.size+255)/256,"Missing or truncated cartridge resources");
     static NativeBoard *board = new NativeBoard();
     board->program = program.p;
     board->opcodes = opcodes.p;
@@ -149,25 +206,58 @@ int main() {
 
     uint32_t nextLogic=get_ticks_us(),logicFrames=0,winLogic=0,skipped=0,maxLogic=0,maxScene=0;
     uint64_t sumAudio=0,sumAcquire=0,sumSave=0,pureLogic=0,pureScene=0;
-    uint32_t overruns=0;uint64_t resyncUs=0;
+    uint32_t overruns=0,presented=0;uint64_t resyncUs=0;
     uint32_t maxDebt=0;
     constexpr uint32_t logicPeriod=16768; // 512*262 / 8 MHz, the reference board's exact frame period.
     uint32_t frames = 0, vblank0 = g_vblanks, winFrames = 0, winStart = get_ticks_us();
     uint64_t sumLogic = 0, sumScene = 0, sumWait = 0;
     uint32_t sumRects = 0, sumMisses = 0, sumUploads = 0;
     char shown[64] = "";
+    unsigned cacheWaits = 0, cacheWaitUs = 0, descriptors = 0, backgroundUs = 0;
+    uint32_t phQueue = 0, phOwner = 0, phSprite = 0, phQueued = 0, phResolved = 0, phDrawn = 0, phPrep = 0, phTouch = 0, phBlitCache = 0, phPlaneTiles = 0;
+    unsigned minHeap = UINT32_MAX, maxOwnership = 0, ownershipFallbacks = 0;
+    bool skipDrawEnabled = true;
     bool tlutMap = true, tmemCache = DDSOM_PROFILE!=8;
 
     for (;;) {
         joypad_poll();
+        { // L: liga/desliga o salto de desenho (comparar fluidez da imagem com a velocidade do jogo)
+            static bool lastL = false;
+            const bool l = joypad_get_buttons(JOYPAD_PORT_1).l;
+            if (l && !lastL) skipDrawEnabled = !skipDrawEnabled;
+            lastL = l;
+        }
+#if DDSOM_HUD
+        { // R esconde os sprites, C-cima esconde os cenarios: mede o custo de cada parte no console
+            static bool lastR = false, lastCu = false, lastCl = false, hideSprites = false, hidePlanes = false, rspTiles = true;
+            const joypad_buttons_t b = joypad_get_buttons(JOYPAD_PORT_1);
+            if (b.r && !lastR) hideSprites = !hideSprites;
+            if (b.c_up && !lastCu) hidePlanes = !hidePlanes;
+            if (b.c_left && !lastCl) rspTiles = !rspTiles; // C-esquerda: cenarios pelo RSP ou pelo caminho antigo
+            lastR = b.r; lastCu = b.c_up; lastCl = b.c_left;
+            RdpVideoSetHide(hideSprites, hidePlanes);
+            RdpVideoSetRspTiles(rspTiles);
+        }
+#endif
         for (int p = 0; p < 4; p++) {
             const joypad_port_t port = static_cast<joypad_port_t>(p);
-            board->players[p] = DDSOM_BENCH_FRAMES?0:Pad(joypad_get_buttons(port), joypad_get_inputs(port));
+            uint16_t benchPad = 0;
+            if (p == 0) {
+                if constexpr (DDSOM_PROFILE == 13) benchPad = ddsom::FirstGameplayPad(frames);
+                if constexpr (DDSOM_PROFILE == 12) {
+                    benchPad = ((frames % 300) == 180 ? kPadCoin : 0) |
+                               ((frames % 300) == 240 ? kPadStart : 0) |
+                               (frames > 60 ? kPadRight : 0) |
+                               ((frames % 20) < 5 ? kPadB1 : 0);
+                }
+            }
+            board->players[p] = DDSOM_BENCH_FRAMES ? benchPad : Pad(joypad_get_buttons(port), joypad_get_inputs(port));
         }
 
         RdpVideoSetTest(tlutMap,tmemCache);
         if(!DDSOM_BENCH_FRAMES){static uint16_t last=0;if(board->players[0]!=last){last=board->players[0];debugf("[DDSOM_INPUT] p1=%04x\n",unsigned(last));}}
         while(int32_t(get_ticks_us()-nextLogic)<0)ddsom::AudioPoll();
+        const uint32_t iterStart = get_ticks_us();
         {
             uint64_t audioBefore=ddsom::AudioTimeTicks();
             uint32_t t0=get_ticks_us();board->RunFrame();uint32_t dt=get_ticks_us()-t0;
@@ -181,33 +271,68 @@ int main() {
         if(int32_t(now-nextLogic)>0&&now-nextLogic>maxDebt)maxDebt=now-nextLogic;
         // Skip drawing when a small logic backlog can be recovered; never discard game updates.
         // Exactly one simulated frame per presentation; never batch four expensive updates.
+        // Atrasado em relacao ao relogio de 60 Hz da placa: este quadro nao e desenhado (a logica ja rodou, nada se perde).
+        // Nunca dois quadros seguidos sem desenho: a imagem fica em pelo menos 30 quadros por segundo.
+        static bool lastDrawSkipped = false;
+        static uint32_t lastIterUs = 0;
+        const bool skipDraw = skipDrawEnabled && !lastDrawSkipped && (int32_t(now-nextLogic)>0 || lastIterUs>logicPeriod);
+        lastDrawSkipped = skipDraw;
+        uint32_t iterAcquireUs = 0;
+        if(skipDraw){skipped++;}
+        else{
         uint32_t acquire=get_ticks_us();
-        surface_t *fb = display_get();
-        sumAcquire+=get_ticks_us()-acquire;
+        // Buffer livre = o quadro anterior ja foi para a tela (logo o RDP dele terminou). Enquanto espera, o som anda.
+        surface_t *fb;
+        while ((fb = display_try_get()) == nullptr) ddsom::AudioPoll();
+        iterAcquireUs=get_ticks_us()-acquire;
+        sumAcquire+=iterAcquireUs;
         Stats st;
+        g_gpuStart = TICKS_READ();
         rdpq_attach(fb, NULL);
         uint64_t sceneAudio=ddsom::AudioTimeTicks();
         RdpVideoDraw(*board, st, fb);
+#if DDSOM_HUD
         if (shown[0]) {
             rdpq_mode_push();
             rdpq_set_mode_standard();
-            rdpq_text_printf(nullptr, FONT_BUILTIN_DEBUG_MONO, res.width - 88, 18, "%s", shown);
+            rdpq_set_scissor(0, 0, res.width, res.height);
+            rdpq_set_mode_fill(RGBA32(0, 0, 0, 255));
+            rdpq_fill_rectangle(0, 228, res.width, 240);
+            rdpq_set_mode_standard();
+            rdpq_text_printf(nullptr, FONT_BUILTIN_DEBUG_MONO, 8, 237, "%s", shown);
             rdpq_mode_pop();
         }
-        uint32_t audioInScene=TICKS_TO_US(ddsom::AudioTimeTicks()-sceneAudio);pureScene+=st.sceneUs>audioInScene?st.sceneUs-audioInScene:0;
+#endif
+        const uint32_t audioInScene = TICKS_TO_US(ddsom::AudioTimeTicks() - sceneAudio);
+        const uint32_t nestedSceneCost = audioInScene + st.cacheWaitUs;
+        if (st.sceneUs > nestedSceneCost) pureScene += st.sceneUs - nestedSceneCost;
         if(st.sceneUs>maxScene)maxScene=st.sceneUs;
         ddsom::AudioPoll();
-        const uint32_t t2 = get_ticks_us();
-        rdpq_detach_wait();
-        sumWait += get_ticks_us() - t2;
+        rdpq_detach_cb(FrameDone, fb);   // sem esperar: a tela recebe o quadro quando o RDP terminar
+        rspq_flush();
+        sumWait += iterAcquireUs;
         sumScene += st.sceneUs;
         sumRects += st.rects;
         sumMisses += st.misses;
         sumUploads += st.uploads;
-        display_show(fb);
+        cacheWaits += st.cacheWaits;
+        cacheWaitUs += st.cacheWaitUs;
+        descriptors += st.descriptors;
+        backgroundUs += st.backgroundUs;
+        phPrep += st.ownPrepUs; phTouch += st.ownTouchUs; phBlitCache += st.cachedBlitUs; phPlaneTiles += st.tiles;
+        phQueue += st.queueUs; phOwner += st.ownerUs; phSprite += st.spriteUs; phQueued += st.queued; phResolved += st.resolved; phDrawn++;
+        if ((frames & 63) == 0) { // (percorre o heap inteiro: so de vez em quando, e uma estatistica)
+            heap_stats_t heap;
+            sys_get_heap_stats(&heap);
+            if (unsigned(heap.free) < minHeap) minHeap = heap.free;
+        }
+        if (st.ownershipBytes > maxOwnership) maxOwnership = st.ownershipBytes;
+        ownershipFallbacks += st.ownershipFallback;
+        presented++;
+        }
         uint32_t saveBegin=get_ticks_us();if(ddsom::g_options.save)ddsom::SavePoll(*board);sumSave+=get_ticks_us()-saveBegin;
 
-        uint32_t after=get_ticks_us();if(int32_t(after-nextLogic)>int32_t(logicPeriod)){resyncUs+=after-nextLogic;nextLogic=after;overruns++;}
+        uint32_t after=get_ticks_us();const uint32_t iterWallUs=after-iterStart;lastIterUs=iterWallUs>iterAcquireUs?iterWallUs-iterAcquireUs:0;if(int32_t(after-nextLogic)>int32_t(logicPeriod)){resyncUs+=after-nextLogic;nextLogic=after-logicPeriod/2;overruns++;}
         frames++;
         if (++winFrames == 60) {
             const uint32_t now = get_ticks_us();
@@ -219,16 +344,38 @@ int main() {
                    (unsigned long)(sumLogic / 60), (unsigned long)(sumScene / 60), (unsigned long)(sumWait / 60),
                    (unsigned long)(sumRects / 60), (unsigned long)(sumMisses / 60), (unsigned long)(sumUploads / 60),
                    (unsigned long)board->soundRequests, (unsigned long)board->cpu.interpreted);
-            snprintf(shown, sizeof(shown), "FPS %lu.%lu", (unsigned long)(fps100 / 100),
-                     (unsigned long)(fps100 % 100 / 10));
+            const uint32_t presentFps100 = static_cast<uint32_t>(uint64_t(presented) * 100000000ull / (now - winStart ? now - winStart : 1));
+            { // painel: FPS na tela, L logica, S montagem da cena (CPU), W espera do buffer, G RDP (do inicio ao fim do desenho)
+                const uint32_t gf = g_gpuFrames ? g_gpuFrames : 1;
+                const uint32_t g10 = uint32_t(uint64_t(g_gpuTicks) * 10000ull / TICKS_PER_SECOND / gf);
+                g_gpuTicks = 0; g_gpuFrames = 0;
+                const uint32_t pf = presented ? presented : 1;
+                auto ms10 = [](uint64_t us, uint32_t n) { return uint32_t(us / n / 100); };
+                const uint32_t l10 = ms10(sumLogic, 60), s10 = ms10(sumScene, pf), w10 = ms10(sumWait, pf);
+                snprintf(shown, sizeof(shown), "%lu.%lu L%lu.%lu S%lu.%lu W%lu.%lu G%lu.%lu%s",
+                         (unsigned long)(presentFps100 / 100), (unsigned long)(presentFps100 % 100 / 10),
+                         (unsigned long)(l10 / 10), (unsigned long)(l10 % 10), (unsigned long)(s10 / 10), (unsigned long)(s10 % 10),
+                         (unsigned long)(w10 / 10), (unsigned long)(w10 % 10), (unsigned long)(g10 / 10), (unsigned long)(g10 % 10),
+                         skipDrawEnabled ? " *" : "");
+            }
             debugf("[DDSOM_AUDIT] logic_frames=%lu skipped=%lu max_logic_us=%lu max_scene_us=%lu max_debt_us=%lu audio_us=%lu acquire_us=%lu save_us=%lu sound_overflow=%u rom_reads=%lu rom_misses=%lu dispatch_misses=%lu\n",
                 (unsigned long)logicFrames,(unsigned long)skipped,(unsigned long)maxLogic,(unsigned long)maxScene,(unsigned long)maxDebt,
                 (unsigned long)(sumAudio/60),(unsigned long)(sumAcquire/60),(unsigned long)(sumSave/60),board->soundOverflows,
                 (unsigned long)g_romData.reads,(unsigned long)g_romData.misses,(unsigned long)g_perf.dispatchMiss68);
-            debugf("[DDSOM_CLOCK] logic_fps100=%lu tick_us=%lu\n",(unsigned long)(uint64_t(winLogic)*100000000/(now-winStart?now-winStart:1)),(unsigned long)(winLogic?sumLogic/winLogic:0));
+            debugf("[DDSOM_CLOCK] logic_fps100=%lu tick_us=%lu present_fps100=%lu\n",(unsigned long)(uint64_t(winLogic)*100000000/(now-winStart?now-winStart:1)),(unsigned long)(winLogic?sumLogic/winLogic:0),(unsigned long)(uint64_t(presented)*100000000/(now-winStart?now-winStart:1)));presented=0;
             winLogic=0;
-            debugf("[DDSOM_STATE] pc=%06lx ready=%02x busy=%02x\n",(unsigned long)board->cpu.pc,unsigned(board->soundRam[0xfff]),unsigned(board->soundRam[15]));
+            debugf("[DDSOM_STATE] pc=%06lx sound_pending=%u\n",(unsigned long)board->cpu.pc,board->soundWrite - board->soundRead);
             ddsom::AudioReport();RomCacheReport();
+            debugf("[DDSOM_RENDER] ci4_descriptors=%u cache_waits=%u cache_wait_us=%u bg_us=%u "
+                   "min_heap=%u ownership_bytes=%u ownership_fallbacks=%u\n",
+                   descriptors, cacheWaits, cacheWaitUs, backgroundUs, minHeap, maxOwnership, ownershipFallbacks);
+            { const uint32_t d = phDrawn ? phDrawn : 1; // fases da cena por quadro desenhado (us)
+              debugf("[DDSOM_SCENE] drawn=%lu bg_us=%lu queue_us=%lu owner_us=%lu sprite_us=%lu tiles=%lu resolved=%lu own_prep_us=%lu own_touch_us=%lu cache_blit_us=%lu plane_tiles=%lu\n",
+                (unsigned long)phDrawn,(unsigned long)(backgroundUs/d),(unsigned long)(phQueue/d),(unsigned long)(phOwner/d),
+                (unsigned long)(phSprite/d),(unsigned long)(phQueued/d),(unsigned long)(phResolved/d),
+                (unsigned long)(phPrep/d),(unsigned long)(phTouch/d),(unsigned long)(phBlitCache/d),(unsigned long)(phPlaneTiles/d));
+              phQueue = phOwner = phSprite = phQueued = phResolved = phDrawn = phPrep = phTouch = phBlitCache = phPlaneTiles = 0; }
+            cacheWaits = cacheWaitUs = descriptors = backgroundUs = ownershipFallbacks = 0;
             debugf("[DDSOM_PURE_COST] logic_us=%llu scene_us=%llu resyncs=%lu resync_us=%llu\n",(unsigned long long)(pureLogic/60),(unsigned long long)(pureScene/60),(unsigned long)overruns,(unsigned long long)resyncUs);pureLogic=pureScene=0;
             maxLogic=maxScene=maxDebt=0;sumAudio=sumAcquire=sumSave=0;
             vblank0 = g_vblanks;
@@ -237,6 +384,20 @@ int main() {
             sumLogic = sumScene = sumWait = 0;
             sumRects = sumMisses = sumUploads = 0;
         }
+#if DDSOM_BENCH_FRAMES
+#ifndef DDSOM_SAMPLE_FROM
+#define DDSOM_SAMPLE_FROM 2880 // (o trecho de jogo do percurso 13)
+#endif
+#ifndef DDSOM_SAMPLE_TO
+#define DDSOM_SAMPLE_TO DDSOM_BENCH_FRAMES
+#endif
+        if (frames == DDSOM_SAMPLE_FROM) {
+            static bool started = false;
+            if (!started) { started = true; timer_init(); new_timer(TICKS_FROM_US(97), TF_CONTINUOUS, SampleTimer); g_sampling = true; }
+            g_profileNative = true; // (o perfil por rotina do jogo so nesta janela)
+        }
+        if (frames == DDSOM_SAMPLE_TO && g_sampling) { g_sampling = false; g_profileNative = false; SampleReport(); }
+#endif
         if(DDSOM_BENCH_FRAMES&&frames>=DDSOM_BENCH_FRAMES){ReportNativeProfile();debugf("[DDSOM_BENCH_DONE] frames=%lu\n",(unsigned long)frames);for(;;)wait_ms(1000);}
     }
 }

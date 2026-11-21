@@ -20,10 +20,10 @@ struct NativeBoard final : M68KBus {
     M68K cpu{*this};
 
     // Memoria do jogo
-    uint8_t ram[0x10000];          // FF0000-FFFFFF
+    alignas(16) uint8_t ram[0x10000];          // FF0000-FFFFFF
     alignas(16) uint8_t videoRam[0x30000];     // 900000-92FFFF: mapas de tiles, paleta, tabela de scroll por linha
     alignas(16) uint8_t objectRam[2][0x2000];  // 700000 (banco escrito) e 708000 (o outro)
-    uint8_t extraRam[0x4000];      // 660000-663FFF
+    alignas(16) uint8_t extraRam[0x4000];      // 660000-663FFF
     uint8_t soundRam[0x1000];      // 618000-619FFF (byte baixo): a caixa de pedidos de som
 
     // Registradores de video que o jogo escreve (os mesmos indices de video/video.cpp)
@@ -36,6 +36,7 @@ struct NativeBoard final : M68KBus {
     uint16_t priorityControl = 0;
     alignas(16) uint16_t palette[0xC00];       // as 6 paginas de 512 cores, como o jogo as entregou (copiadas quando aponta a paleta)
     bool paletteChanged = true;
+    uint8_t palettePagesChanged = 0x3F; // (as paginas de 0x200 cores que mudaram desde a ultima conversao: o renderizador zera)
 
     // O programa do 68000 (no N64: no cartucho, lido pelo cache de paginas)
     const uint8_t *program = nullptr, *opcodes = nullptr;
@@ -70,8 +71,9 @@ struct NativeBoard final : M68KBus {
     uint16_t Fetch16(uint32_t address) override;
     void InterruptAck(unsigned level) override;
 
-private:
     uint16_t Input(int port) const;
+
+private:
     void WriteRegister(uint32_t address, uint16_t value, uint16_t mask);
     void TakePalette();
 };

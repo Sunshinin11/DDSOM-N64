@@ -184,21 +184,71 @@ def make_routines(blocks, first, rest):
     return routines
 
 
-def liveness(block):
-    """For each instruction of the block, whether the flags it sets are wanted. At the block's end and at
-    every way out of it all flags are (the state must be whole wherever the routine can be left)."""
+_LIVE_IN = {}   # block address -> flags the block (and what it reaches by branches and running on) reads before writing
+
+
+def _scan(block, live_in, wanted=None):
+    """Walks a block backwards. Returns the flags wanted on entering it; fills `wanted` (per instruction: whether the
+    flags it sets are read before being overwritten). Where control goes to a block of the program, what that block
+    wants counts; everywhere else (calls, returns, computed jumps, the interpreter) all flags are wanted, the state
+    having to be whole there."""
+    insns = block.insns
+    last = len(insns) - 1
     live = m68k.ALL
+    for n in range(last, -1, -1):
+        insn = insns[n]
+        nxt = insn.addr + insn.length
+        if insn.interp:
+            after = m68k.ALL
+        elif insn.flow == "next":
+            after = live_in.get(nxt, m68k.ALL) if n == last else live
+        elif insn.flow in ("cond", "dbcc"):
+            after = (live_in.get(nxt, m68k.ALL) if n == last else live) | live_in.get(insn.target, m68k.ALL)
+        elif insn.flow == "branch":
+            after = live_in.get(insn.target, m68k.ALL)
+        else:
+            after = m68k.ALL
+        if wanted is not None:
+            wanted[n] = insn.defs & after  # (the mask: emitters set only the flags read later, m68k.flags_of)
+        live = (after & ~insn.kills) | insn.uses
+        if insn.interp:
+            live = m68k.ALL
+    return live
+
+
+def compute_live(blocks, hooks):
+    """Flags wanted at the start of every block, to a fixed point (what a block wants is what its exits want, less
+    what it writes, plus what it reads). A hook's place wants all of them: the hook's code may look at any."""
+    live_in = {addr: 0 for addr in blocks}
+    order = sorted(blocks, reverse=True)
+    changed = True
+    while changed:
+        changed = False
+        for addr in order:
+            value = m68k.ALL if addr in hooks else _scan(blocks[addr], live_in)
+            if value != live_in[addr]:
+                live_in[addr] = value
+                changed = True
+    _LIVE_IN.clear()
+    _LIVE_IN.update(live_in)
+
+
+def liveness(block):
+    """For each instruction of the block, whether the flags it sets are wanted."""
     wanted = [True] * len(block.insns)
+    if _LIVE_IN:
+        _scan(block, _LIVE_IN, wanted)
+        return wanted
+    live = m68k.ALL
     for n in range(len(block.insns) - 1, -1, -1):
         insn = block.insns[n]
         if insn.flow != "next" or insn.interp:
             live = m68k.ALL
-        wanted[n] = bool(insn.defs & live)
+        wanted[n] = insn.defs & live
         live = (live & ~insn.kills) | insn.uses
         if insn.interp:
             live = m68k.ALL
     return wanted
-
 
 
 def directly(insn, mem, nxt):
@@ -237,9 +287,10 @@ def directly(insn, mem, nxt):
     return None
 
 PROMOTE = False
+PROMOTE_ONLY = None  # (with PROMOTE: only these routine heads; None: all)
 
 
-def emit_routine(out, head, members, blocks, mem, hooks=()):
+def emit_routine(out, head, members, blocks, mem, hooks=(), native_time=False):
     first_line = len(out)
     def label(addr):
         return "L_%06X" % addr
@@ -256,11 +307,16 @@ def emit_routine(out, head, members, blocks, mem, hooks=()):
         return "LEAVE(0x%Xu);" % addr
 
     out.append("void fn_%06X(M68K &c) {" % head)
-    out.append("    switch (c.pc) {")
-    for addr in members:
-        out.append("    case 0x%X: goto %s;" % (addr, label(addr)))
-    out.append("    default: cps2recomp::native::NotHere(c, 0x%Xu);" % head)
-    out.append("    }")
+    # Every table lookup or generated call supplies an exact block address.
+    # A native-time routine with just one entry has no dispatch to do.
+    if not native_time or len(members) != 1:
+        out.append("    switch (c.pc) {")
+        for addr in members:
+            out.append("    case 0x%X: goto %s;" % (addr, label(addr)))
+        out.append("    default: cps2recomp::native::NotHere(c, 0x%Xu);" % head)
+        out.append("    }")
+    else:
+        out.append("    goto %s;" % label(head))
     for index, addr in enumerate(members):
         block = blocks[addr]
         out.append("    BLOCK(%s, 0x%Xu)" % (label(addr), addr))
@@ -375,7 +431,7 @@ def emit_routine(out, head, members, blocks, mem, hooks=()):
                 out.append("    %s" % go(nxt))
     out.append("}")
     out.append("")
-    if PROMOTE:
+    if PROMOTE and (PROMOTE_ONLY is None or head in PROMOTE_ONLY):
         import re as _re
         body = out[first_line:]
         text = "\n".join(body)
@@ -404,6 +460,9 @@ def main():
     ap.add_argument("--limit", default=None, help="the end of the code (hex); default: the whole program")
     ap.add_argument("--native-time", action="store_true", help="no 68000 cycle accounting in the generated code")
     ap.add_argument("--promote-regs", action="store_true", help="d0-d7/a0-a7 in locals within a routine (saved where it leaves, calls, or runs a hook)")
+    ap.add_argument("--promote-only", default=None,
+                    help="with --promote-regs: only the routines listed in this file (hex addresses, one a line); "
+                         "promoting every routine makes the code too big for the N64's memory")
     ap.add_argument("--no-tables", action="store_true", help="do not look for jump tables")
     ap.add_argument("--guess", default=None,
                     help="also translate code found by looking at the program (guess.py); the guesses are kept in this file")
@@ -419,8 +478,11 @@ def main():
                          "this one (a game's family.h: {0x..., 0x...} pairs)")
     args = ap.parse_args()
 
-    global PROMOTE
+    global PROMOTE, PROMOTE_ONLY
     PROMOTE = args.promote_regs
+    PROMOTE_ONLY = None
+    if args.promote_only:
+        PROMOTE_ONLY = {int(v.split("#")[0], 16) for v in open(args.promote_only) if v.split("#")[0].strip()}
     mem = open(args.program, "rb").read()
     limit = int(args.limit, 16) if args.limit else len(mem)
     reset = int.from_bytes(mem[4:8], "big")
@@ -500,6 +562,8 @@ def main():
     routines = make_routines(blocks, first, [e for e in entries + guessed if e not in calls] + sorted(starts))
     leftover = [b.addr for b in blocks.values() if b.routine is None]
     assert not leftover, leftover[:8]
+    if not os.environ.get("RECOMP_LOCAL_FLAGS"):
+        compute_live(blocks, set(hooks))  # (flags wanted across blocks, not only within one)
 
     os.makedirs(args.out, exist_ok=True)
     written = set()
@@ -519,7 +583,7 @@ def main():
     files = []
     current = list(header)
     for head, members in routines:
-        emit_routine(current, head, members, blocks, mem, set(hooks))
+        emit_routine(current, head, members, blocks, mem, set(hooks), native_time=args.native_time)
         if len(current) > FILE_LINES:
             files.append(current)
             current = list(header)
@@ -532,16 +596,25 @@ def main():
     decl += ["void fn_%06X(cps2recomp::M68K &c);" % head for head, _ in routines]
     write("native_decl.h", "\n".join(decl) + "\n")
 
+    order = sorted(blocks)
+    heads = sorted(set(blocks[a].routine for a in order))
+    index = {h: i for i, h in enumerate(heads)}
+    assert len(heads) < 65536 and all(blocks[a].end - a < 65536 for a in order)
+
+    def array(ctype, name, values, fmt):
+        out = ["static const %s %s[] = {" % (ctype, name)]
+        for i in range(0, len(values), 12):
+            out.append("    " + ", ".join(fmt % v for v in values[i:i + 12]) + ",")
+        return out + ["};", ""]
+
     table = ["// Generated by cps2recomp/tools/recomp.py", '#include "native.h"', '#include "native_decl.h"', "",
-             "namespace cps2recomp {", "", "static const NativeEntry kEntries[] = {"]
-    for addr in sorted(blocks):
-        table.append("    {0x%X, fn_%06X}," % (addr, blocks[addr].routine))
-    table += ["};", "", "static const NativeRange kRanges[] = {"]
-    for addr in sorted(blocks):
-        table.append("    {0x%X, 0x%X}," % (addr, blocks[addr].end))
-    table += ["};", "", "static const uint32_t kHooks[] = {" + "".join("0x%X, " % h for h in hooks) + "0};", "",
-              "const NativeCode kNativeCode = {kEntries, sizeof(kEntries) / sizeof(kEntries[0]), kRanges,",
-              "                                sizeof(kRanges) / sizeof(kRanges[0]), kHooks, %d};" % len(hooks), "",
+             "namespace cps2recomp {", ""]
+    table += array("uint32_t", "kAddresses", order, "0x%X")
+    table += array("uint16_t", "kRoutineOf", [index[blocks[a].routine] for a in order], "%d")
+    table += array("uint16_t", "kLengths", [blocks[a].end - a for a in order], "%d")
+    table += ["static const NativeFn kRoutines[] = {" + ", ".join("fn_%06X" % h for h in heads) + "};", ""]
+    table += ["static const uint32_t kHooks[] = {" + "".join("0x%X, " % h for h in hooks) + "0};", "",
+              "const NativeCode kNativeCode = {kAddresses, kRoutineOf, kLengths, kRoutines, %d, kHooks, %d};" % (len(order), len(hooks)), "",
               "} // namespace cps2recomp"]
     write("native_table.cpp", "\n".join(table) + "\n")
 

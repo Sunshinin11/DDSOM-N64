@@ -144,6 +144,8 @@ public:
     uint8_t *ram = nullptr;          // FF0000-FFFFFF
     uint8_t *video = nullptr;        // 900000 and up: video RAM (for the check of rewrites that write it)
     uint32_t videoSize = 0;
+    uint8_t *extra = nullptr;        // 660000-663FFF: extra RAM (native board fast path)
+    uint8_t *objWrite = nullptr;     // 708000-70FFFF: active object write bank (native board fast path)
     const uint8_t *rom = nullptr;    // the program as data
     const uint8_t *opcodes = nullptr; // the program as program
     uint32_t romSize = 0;
@@ -154,8 +156,13 @@ public:
     using PointerFn = uint32_t (*)(uint32_t address, uint32_t value);
     PointerFn pointerFrom = nullptr;
     uint32_t extraLow = 0xFFFFFFFF, extraHigh = 0;
-    uint32_t PointerLoad(uint32_t address, uint32_t value) const {
+    __attribute__((always_inline)) inline uint32_t PointerLoad(uint32_t address, uint32_t value) const {
+#ifdef DDSOM_NATIVE_BOARD
+        (void)address;
+        return value;
+#else
         return (address & 0xFFFFFF) - extraLow < extraHigh - extraLow && pointerFrom ? pointerFrom(address & 0xFFFFFF, value) : value;
+#endif
     }
 
     // Addresses reached in ways the translator cannot follow (computed jumps, returns, exceptions) that are
@@ -218,7 +225,7 @@ public:
     // --- arithmetic and flags, shared by the interpreter and translated code ---
     // Sizes: 0 a byte, 1 a word, 2 a long word
 
-    bool Condition(unsigned cc) const {
+    __attribute__((always_inline)) inline bool Condition(unsigned cc) const {
         switch (cc) {
         case 0: return true;
         case 1: return false;
@@ -238,38 +245,151 @@ public:
         default: return flagZ || flagN != flagV;
         }
     }
-    uint32_t Add(uint32_t x, uint32_t y, unsigned size, bool withX, bool keepZ) {
-        const uint64_t sum = static_cast<uint64_t>(x & kMask[size]) + (y & kMask[size]) + (withX && flagX);
-        const uint32_t result = static_cast<uint32_t>(sum) & kMask[size];
-        flagC = flagX = (sum >> (kBytes[size] * 8)) & 1;
-        flagV = (~(x ^ y) & (x ^ result) & kSign[size]) != 0;
-        flagN = result & kSign[size];
-        flagZ = keepZ ? (flagZ && result == 0) : result == 0;
+    __attribute__((always_inline)) inline uint32_t Add(uint32_t x, uint32_t y, unsigned size, bool withX, bool keepZ) {
+        const uint32_t xin = withX && flagX ? 1u : 0u;
+        uint32_t result, sign;
+        bool carry;
+        if (size == 0) {
+            const uint32_t sum = (x & 0xFFu) + (y & 0xFFu) + xin;
+            result = sum & 0xFFu;
+            carry = (sum >> 8) != 0;
+            sign = 0x80u;
+        } else if (size == 1) {
+            const uint32_t sum = (x & 0xFFFFu) + (y & 0xFFFFu) + xin;
+            result = sum & 0xFFFFu;
+            carry = (sum >> 16) != 0;
+            sign = 0x8000u;
+        } else {
+            const uint32_t sum1 = x + y;
+            result = sum1 + xin;
+            carry = (sum1 < x) || (result < sum1);
+            sign = 0x80000000u;
+        }
+        flagC = flagX = carry;
+        flagV = (~(x ^ y) & (x ^ result) & sign) != 0;
+        flagN = (result & sign) != 0;
+        flagZ = keepZ ? (flagZ && result == 0) : (result == 0);
         return result;
     }
     // x - y
-    uint32_t Sub(uint32_t x, uint32_t y, unsigned size, bool withX, bool keepZ, bool setX = true) {
-        const uint64_t difference = static_cast<uint64_t>(x & kMask[size]) - (y & kMask[size]) - (withX && flagX);
-        const uint32_t result = static_cast<uint32_t>(difference) & kMask[size];
-        flagC = (difference >> (kBytes[size] * 8)) & 1;
-        if (setX) {
-            flagX = flagC;
+    __attribute__((always_inline)) inline uint32_t Sub(uint32_t x, uint32_t y, unsigned size, bool withX, bool keepZ, bool setX = true) {
+        const uint32_t xin = withX && flagX ? 1u : 0u;
+        uint32_t result, sign;
+        bool borrow;
+        if (size == 0) {
+            const uint32_t diff = (x & 0xFFu) - (y & 0xFFu) - xin;
+            result = diff & 0xFFu;
+            borrow = (diff >> 8) != 0;
+            sign = 0x80u;
+        } else if (size == 1) {
+            const uint32_t diff = (x & 0xFFFFu) - (y & 0xFFFFu) - xin;
+            result = diff & 0xFFFFu;
+            borrow = (diff >> 16) != 0;
+            sign = 0x8000u;
+        } else {
+            const uint32_t diff1 = x - y;
+            result = diff1 - xin;
+            borrow = (x < y) || (diff1 < xin);
+            sign = 0x80000000u;
         }
-        flagV = ((x ^ y) & (x ^ result) & kSign[size]) != 0;
-        flagN = result & kSign[size];
-        flagZ = keepZ ? (flagZ && result == 0) : result == 0;
+        flagC = borrow;
+        if (setX) {
+            flagX = borrow;
+        }
+        flagV = ((x ^ y) & (x ^ result) & sign) != 0;
+        flagN = (result & sign) != 0;
+        flagZ = keepZ ? (flagZ && result == 0) : (result == 0);
         return result;
     }
-    void Logic(uint32_t result, unsigned size) {
-        flagN = result & kSign[size];
-        flagZ = (result & kMask[size]) == 0;
+    __attribute__((always_inline)) inline void Logic(uint32_t result, unsigned size) {
+        const uint32_t mask = size == 0 ? 0xFFu : (size == 1 ? 0xFFFFu : 0xFFFFFFFFu);
+        const uint32_t sign = size == 0 ? 0x80u : (size == 1 ? 0x8000u : 0x80000000u);
+        flagN = (result & sign) != 0;
+        flagZ = (result & mask) == 0;
         flagV = flagC = false;
+    }
+    // For translated code (tools/m68k.py): only the flags in F (N 8, Z 4, V 2, C 1) that are read before being set
+    // again; the others keep their old values, which nothing reads. F = 15 is Logic / Sub(..., setX false) exactly.
+    template <unsigned F>
+    __attribute__((always_inline)) inline void LogicF(uint32_t result, unsigned size) {
+        const uint32_t mask = size == 0 ? 0xFFu : (size == 1 ? 0xFFFFu : 0xFFFFFFFFu);
+        const uint32_t sign = size == 0 ? 0x80u : (size == 1 ? 0x8000u : 0x80000000u);
+        if (F & 8) flagN = (result & sign) != 0;
+        if (F & 4) flagZ = (result & mask) == 0;
+        if (F & 2) flagV = false;
+        if (F & 1) flagC = false;
+    }
+    // cmp: x - y, flags only (X untouched, as Sub(x, y, size, false, false, false))
+    template <unsigned F>
+    __attribute__((always_inline)) inline void CmpF(uint32_t x, uint32_t y, unsigned size) {
+        const uint32_t mask = size == 0 ? 0xFFu : (size == 1 ? 0xFFFFu : 0xFFFFFFFFu);
+        const uint32_t sign = size == 0 ? 0x80u : (size == 1 ? 0x8000u : 0x80000000u);
+        const uint32_t a = x & mask, b = y & mask, result = (a - b) & mask;
+        if (F & 1) flagC = a < b;
+        if (F & 2) flagV = ((x ^ y) & (x ^ result) & sign) != 0;
+        if (F & 8) flagN = (result & sign) != 0;
+        if (F & 4) flagZ = result == 0;
     }
     // kind: 0 arithmetic shift, 1 logical shift, 2 rotate through X, 3 rotate
     uint32_t Shift(unsigned kind, bool left, uint32_t value, unsigned count, unsigned size) {
-        const uint32_t sign = kSign[size];
-        value &= kMask[size];
+        const uint32_t mask = size == 0 ? 0xFFu : (size == 1 ? 0xFFFFu : 0xFFFFFFFFu);
+        const uint32_t sign = size == 0 ? 0x80u : (size == 1 ? 0x8000u : 0x80000000u);
+        value &= mask;
         flagV = false;
+        if (count == 0) {
+            flagC = kind == 2 ? flagX : false;
+            flagN = (value & sign) != 0;
+            flagZ = value == 0;
+            return value;
+        }
+        if (kind <= 1 && count <= 31) {
+            const unsigned bits = 8u << size;
+            bool out = false;
+            if (kind == 1) {
+                if (left) {
+                    if (count < bits) {
+                        out = ((value >> (bits - count)) & 1u) != 0;
+                        value = (value << count) & mask;
+                    } else {
+                        out = (count == bits) && ((value & 1u) != 0);
+                        value = 0;
+                    }
+                } else {
+                    if (count < bits) {
+                        out = ((value >> (count - 1)) & 1u) != 0;
+                        value >>= count;
+                    } else {
+                        out = (count == bits) && ((value & sign) != 0);
+                        value = 0;
+                    }
+                }
+            } else if (!left) {
+                const bool neg = (value & sign) != 0;
+                if (count < bits) {
+                    out = ((value >> (count - 1)) & 1u) != 0;
+                    value = (value >> count) | (neg ? (mask & ~(mask >> count)) : 0u);
+                } else {
+                    out = neg;
+                    value = neg ? mask : 0u;
+                }
+            } else {
+                if (count < bits) {
+                    const uint32_t topMask = (count + 1 == bits) ? mask : (mask & ~(mask >> (count + 1)));
+                    const uint32_t top = value & topMask;
+                    flagV = top != 0 && top != topMask;
+                    out = ((value >> (bits - count)) & 1u) != 0;
+                    value = (value << count) & mask;
+                } else {
+                    flagV = value != 0;
+                    out = (count == bits) && ((value & 1u) != 0);
+                    value = 0;
+                }
+            }
+            flagC = flagX = out;
+            flagN = (value & sign) != 0;
+            flagZ = value == 0;
+            return value;
+        }
         flagC = kind == 2 ? flagX : false;
         for (unsigned i = 0; i < count; i++) {
             const bool out = left ? (value & sign) : (value & 1);
@@ -281,7 +401,7 @@ public:
             default: in = out ? (left ? 1 : sign) : 0; break;
             }
             const uint32_t before = value;
-            value = left ? ((value << 1) & kMask[size]) | in : (value >> 1) | in;
+            value = left ? ((value << 1) & mask) | in : (value >> 1) | in;
             flagC = out;
             if (kind != 3) {
                 flagX = out;

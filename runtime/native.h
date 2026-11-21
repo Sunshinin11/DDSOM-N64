@@ -19,24 +19,22 @@
 
 namespace cps2recomp {
 
-// A block's start and the routine it is in; and the stretch of program a block covers
-struct NativeEntry {
-    uint32_t address;
-    NativeFn fn;
-};
-struct NativeRange {
-    uint32_t start, end;
-};
+// The translated blocks, sorted by address, in parallel arrays (8 bytes a block): where it starts, the routine it is in
+// (an index into routines) and how long it is in bytes. The blocks do not overlap.
 struct NativeCode {
-    const NativeEntry *entries;
+    const uint32_t *addresses;
+    const uint16_t *routineOf;
+    const uint16_t *lengths;
+    const NativeFn *routines;
     size_t entryCount;
-    const NativeRange *ranges;
-    size_t rangeCount;
     const uint32_t *hooks; // the addresses at which the translated code stops by for a hook (lift.h)
     size_t hookCount;
     // Set by the build without translated code only (runtime/no_blocks.cpp): words a release's check looks for in a
     // program (tools/release/check_archive.sh), to tell that build from a release's
     const char *none = nullptr;
+    uint32_t Address(size_t n) const { return addresses[n]; }
+    uint32_t End(size_t n) const { return addresses[n] + lengths[n]; }
+    NativeFn Fn(size_t n) const { return routines[routineOf[n]]; }
 };
 // The game's translated code (generated; an empty set when there is none)
 extern const NativeCode kNativeCode;
@@ -50,13 +48,21 @@ namespace check {
 uint64_t BlocksChecked();
 #endif
 
+#if defined(CPS2RECOMP_N64) && defined(DDSOM_NATIVE_BOARD)
+uint16_t ReadNativeJoypad(M68K &c, unsigned port);
+#endif
+
 namespace native {
+    // Video RAM pages (16 KB) written since a reader (a bit each) last looked: the N64 renderer's plane cache uses it
+    // to know a tile map did not change without reading it
+    inline uint8_t g_videoDirty[0x30000 >> 8]; // escritas na RAM de video por bloco de 256 bytes (bits: quem ainda nao viu; NativeBoard::Reset marca tudo)
+
 
     constexpr unsigned kMaxDepth = 64;
 #ifdef DDSOM_NATIVE_TIME
     // (what a run of the game wrote, in order: a pass of the scheduler that writes what the one before it did, from the same
     // registers, changes nothing: the game is waiting; port_n64/board.cpp)
-#define WRITE_HASH(c, address, value) ((c).writeHash = ((c).writeHash + (address)) * 31u + (value))
+#define WRITE_HASH(c, address, value) ((c).writeHash = ((c).writeHash * 33u) ^ (address) ^ (value))
 #else
 #define WRITE_HASH(c, address, value)
 #endif
@@ -110,7 +116,9 @@ namespace native {
 #endif
         }
 #ifdef DDSOM_NATIVE_BOARD
-        if(address-0x900000u<c.videoSize)return c.video[address-0x900000u];
+        if (address - 0x900000u < 0x30000u) return c.video[address - 0x900000u];
+        if (address - 0x708000u < 0x8000u) return c.objWrite[address & 0x1FFF];
+        if (address - 0x660000u < 0x4000u) return c.extra[address - 0x660000u];
 #endif
         return c.bus.Read8(address);
     }
@@ -134,18 +142,60 @@ namespace native {
 #endif
         }
 #ifdef DDSOM_NATIVE_BOARD
-        if(address-0x900000u<c.videoSize){
-            const uint8_t*p=c.video+address-0x900000u;
+        if (address - 0x900000u < 0x30000u) {
+            const uint8_t *p = c.video + address - 0x900000u;
 #if defined(CPS2RECOMP_N64) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
-            typedef uint16_t Alias __attribute__((may_alias));return *reinterpret_cast<const Alias*>(p);
+            typedef uint16_t Alias __attribute__((may_alias));
+            return *reinterpret_cast<const Alias*>(p);
 #else
-            return uint32_t(p[0])<<8|p[1];
+            return uint32_t(p[0]) << 8 | p[1];
+#endif
+        }
+        if (address - 0x708000u < 0x8000u) {
+            const uint8_t *p = c.objWrite + (address & 0x1FFE);
+#if defined(CPS2RECOMP_N64) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+            typedef uint16_t Alias __attribute__((may_alias));
+            return *reinterpret_cast<const Alias*>(p);
+#else
+            return uint32_t(p[0]) << 8 | p[1];
+#endif
+        }
+        if (address - 0x660000u < 0x4000u) {
+            const uint8_t *p = c.extra + (address - 0x660000u);
+#if defined(CPS2RECOMP_N64) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+            typedef uint16_t Alias __attribute__((may_alias));
+            return *reinterpret_cast<const Alias*>(p);
+#else
+            return uint32_t(p[0]) << 8 | p[1];
 #endif
         }
 #endif
         return c.bus.Read16(address);
     }
     inline uint32_t R32(M68K &c, uint32_t address) {
+        address &= 0xFFFFFE;
+#if defined(CPS2RECOMP_N64) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+        if (address >= 0xFF0000) {
+            if ((address & 0xFFFF) <= 0xFFFC) {
+                typedef uint32_t Alias32 __attribute__((may_alias, aligned(2)));
+                return *reinterpret_cast<const Alias32*>(&c.ram[address & 0xFFFF]);
+            }
+        } else if (address + 4 <= c.romSize) {
+            return RomLong(g_romData, address);
+        }
+#ifdef DDSOM_NATIVE_BOARD
+        else if (address - 0x900000u <= 0x2FFFCu) {
+            typedef uint32_t Alias32 __attribute__((may_alias, aligned(2)));
+            return *reinterpret_cast<const Alias32*>(c.video + address - 0x900000u);
+        } else if (address - 0x708000u < 0x8000u && (address & 0x1FFE) <= 0x1FFC) {
+            typedef uint32_t Alias32 __attribute__((may_alias, aligned(2)));
+            return *reinterpret_cast<const Alias32*>(c.objWrite + (address & 0x1FFE));
+        } else if (address - 0x660000u <= 0x3FFCu) {
+            typedef uint32_t Alias32 __attribute__((may_alias, aligned(2)));
+            return *reinterpret_cast<const Alias32*>(c.extra + (address - 0x660000u));
+        }
+#endif
+#endif
         const uint32_t high = R16(c, address);
         return (high << 16) | R16(c, address + 2);
     }
@@ -156,31 +206,53 @@ namespace native {
             c.ram[address & 0xFFFF] = static_cast<uint8_t>(value);
         } else {
 #ifdef DDSOM_NATIVE_BOARD
-            if(address-0x900000u<c.videoSize){c.video[address-0x900000u]=uint8_t(value);return;}
+            if (address - 0x900000u < 0x30000u) { g_videoDirty[(address - 0x900000u) >> 8] = 255; c.video[address - 0x900000u] = uint8_t(value); return; }
+            if (address - 0x708000u < 0x8000u) { c.objWrite[address & 0x1FFF] = uint8_t(value); return; }
+            if (address - 0x660000u < 0x4000u) { c.extra[address - 0x660000u] = uint8_t(value); return; }
 #endif
             c.bus.Write8(address, static_cast<uint8_t>(value));
         }
     }
-    inline void W16(M68K &c, uint32_t address, uint32_t value) {
-        address &= 0xFFFFFE;
-        WRITE_HASH(c, address, value);
+    inline void W16NoHash(M68K &c, uint32_t address, uint32_t value) {
         if (address >= 0xFF0000) {
             uint8_t *p = &c.ram[address & 0xFFFF];
 #if defined(CPS2RECOMP_N64) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
             typedef uint16_t Alias __attribute__((may_alias));
-            *reinterpret_cast<Alias*>(p)=static_cast<uint16_t>(value);
+            *reinterpret_cast<Alias*>(p) = static_cast<uint16_t>(value);
 #else
             p[0] = static_cast<uint8_t>(value >> 8);
             p[1] = static_cast<uint8_t>(value);
 #endif
         } else {
 #ifdef DDSOM_NATIVE_BOARD
-            if(address-0x900000u<c.videoSize){
-                uint8_t*p=c.video+address-0x900000u;
+            if (address - 0x900000u < 0x30000u) {
+                g_videoDirty[(address - 0x900000u) >> 8] = 255;
+                uint8_t *p = c.video + address - 0x900000u;
 #if defined(CPS2RECOMP_N64) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
-                typedef uint16_t Alias __attribute__((may_alias));*reinterpret_cast<Alias*>(p)=uint16_t(value);
+                typedef uint16_t Alias __attribute__((may_alias));
+                *reinterpret_cast<Alias*>(p) = uint16_t(value);
 #else
-                p[0]=value>>8;p[1]=value;
+                p[0] = value >> 8; p[1] = value;
+#endif
+                return;
+            }
+            if (address - 0x708000u < 0x8000u) {
+                uint8_t *p = c.objWrite + (address & 0x1FFE);
+#if defined(CPS2RECOMP_N64) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+                typedef uint16_t Alias __attribute__((may_alias));
+                *reinterpret_cast<Alias*>(p) = uint16_t(value);
+#else
+                p[0] = value >> 8; p[1] = value;
+#endif
+                return;
+            }
+            if (address - 0x660000u < 0x4000u) {
+                uint8_t *p = c.extra + (address - 0x660000u);
+#if defined(CPS2RECOMP_N64) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+                typedef uint16_t Alias __attribute__((may_alias));
+                *reinterpret_cast<Alias*>(p) = uint16_t(value);
+#else
+                p[0] = value >> 8; p[1] = value;
 #endif
                 return;
             }
@@ -188,12 +260,64 @@ namespace native {
             c.bus.Write16(address, static_cast<uint16_t>(value));
         }
     }
+    inline void W16(M68K &c, uint32_t address, uint32_t value) {
+        address &= 0xFFFFFE;
+        WRITE_HASH(c, address, value);
+        W16NoHash(c, address, value);
+    }
     inline void W32(M68K &c, uint32_t address, uint32_t value) {
-        W16(c, address, value >> 16);
-        W16(c, address + 2, value);
+        address &= 0xFFFFFE;
+        WRITE_HASH(c, address, value);
+#if defined(CPS2RECOMP_N64) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+        if (address >= 0xFF0000) {
+            if ((address & 0xFFFF) <= 0xFFFC) {
+                typedef uint32_t Alias32 __attribute__((may_alias, aligned(2)));
+                *reinterpret_cast<Alias32*>(&c.ram[address & 0xFFFF]) = value;
+                return;
+            }
+        } else {
+#ifdef DDSOM_NATIVE_BOARD
+            if (address - 0x900000u <= 0x2FFFCu) {
+                const uint32_t off = address - 0x900000u;
+                g_videoDirty[off >> 8] = 255;
+                g_videoDirty[(off + 2) >> 8] = 255;
+                typedef uint32_t Alias32 __attribute__((may_alias, aligned(2)));
+                *reinterpret_cast<Alias32*>(c.video + off) = value;
+                return;
+            }
+            if (address - 0x708000u < 0x8000u && (address & 0x1FFE) <= 0x1FFC) {
+                typedef uint32_t Alias32 __attribute__((may_alias, aligned(2)));
+                *reinterpret_cast<Alias32*>(c.objWrite + (address & 0x1FFE)) = value;
+                return;
+            }
+            if (address - 0x660000u <= 0x3FFCu) {
+                typedef uint32_t Alias32 __attribute__((may_alias, aligned(2)));
+                *reinterpret_cast<Alias32*>(c.extra + (address - 0x660000u)) = value;
+                return;
+            }
+#endif
+        }
+#endif
+        W16NoHash(c, address, value >> 16);
+        W16NoHash(c, (address + 2) & 0xFFFFFE, value);
     }
 #endif
 
+    inline uint32_t Joypad8(M68K &c, uint32_t address) {
+#if defined(CPS2RECOMP_N64) && defined(DDSOM_NATIVE_BOARD) && !defined(CPS2RECOMP_CHECK)
+        const uint16_t input = ReadNativeJoypad(c, (address - 0x804000u) >> 4);
+        return address & 1 ? input & 0xFFu : input >> 8;
+#else
+        return R8(c, address);
+#endif
+    }
+    inline uint32_t Joypad16(M68K &c, uint32_t address) {
+#if defined(CPS2RECOMP_N64) && defined(DDSOM_NATIVE_BOARD) && !defined(CPS2RECOMP_CHECK)
+        return ReadNativeJoypad(c, (address - 0x804000u) >> 4);
+#else
+        return R16(c, address);
+#endif
+    }
     // Memory as program (what addressing relative to the PC reads): the deciphered ROM
     inline uint32_t P16(M68K &c, uint32_t address) {
         address &= 0xFFFFFE;
@@ -212,9 +336,96 @@ namespace native {
         return (address & 1) ? (word & 0xFF) : (word >> 8);
     }
     inline uint32_t P32(M68K &c, uint32_t address) {
+        address &= 0xFFFFFE;
+#ifdef CPS2RECOMP_N64
+        if (address + 4 <= c.romSize) {
+            return RomLong(g_romOpcodes, address);
+        }
+#endif
         const uint32_t high = P16(c, address);
         return (high << 16) | P16(c, address + 2);
     }
+
+#if defined(CPS2RECOMP_N64) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__ && !defined(CPS2RECOMP_CHECK)
+    // Acesso a memoria do codigo gerado no N64. Compilado com -Os (o executavel precisa caber na RAM), cada acesso
+    // virava a chamada de uma funcao grande, que montava pilha mesmo para a RAM de trabalho (FF0000-FFFFFF, de longe o
+    // caso comum). Agora: uma funcao minima resolve a RAM de trabalho sem pilha e so o resto vai para a completa
+    // (SlowX = as definicoes acima). Nos arquivos mais quentes (DDSOM_FAST_RAM, Makefile.test) a RAM fica embutida.
+    __attribute__((noinline)) inline uint32_t SlowR8(M68K &c, uint32_t a) { return R8(c, a); }
+    __attribute__((noinline)) inline uint32_t SlowR16(M68K &c, uint32_t a) { return R16(c, a); }
+    __attribute__((noinline)) inline uint32_t SlowR32(M68K &c, uint32_t a) { return R32(c, a); }
+    __attribute__((noinline)) inline void SlowW8(M68K &c, uint32_t a, uint32_t v) { W8(c, a, v); }
+    __attribute__((noinline)) inline void SlowW16(M68K &c, uint32_t a, uint32_t v) { W16(c, a, v); }
+    __attribute__((noinline)) inline void SlowW32(M68K &c, uint32_t a, uint32_t v) { W32(c, a, v); }
+    __attribute__((noinline)) inline uint32_t SlowP32(M68K &c, uint32_t a) { return P32(c, a); }
+#ifdef DDSOM_FAST_RAM
+#define DDSOM_ACCESS __attribute__((always_inline)) static inline
+#else
+#define DDSOM_ACCESS __attribute__((noinline)) inline
+#endif
+    DDSOM_ACCESS uint32_t FastR8(M68K &c, uint32_t a) {
+        if (__builtin_expect((a & 0xFFFFFF) >= 0xFF0000, 1)) return c.ram[a & 0xFFFF];
+        return SlowR8(c, a);
+    }
+    DDSOM_ACCESS uint32_t FastR16(M68K &c, uint32_t a) {
+        if (__builtin_expect((a & 0xFFFFFF) >= 0xFF0000, 1)) {
+            typedef uint16_t Alias __attribute__((may_alias));
+            return *reinterpret_cast<const Alias *>(&c.ram[a & 0xFFFE]);
+        }
+        return SlowR16(c, a);
+    }
+    DDSOM_ACCESS uint32_t FastR32(M68K &c, uint32_t a) {
+        if (__builtin_expect((a & 0xFFFFFF) >= 0xFF0000 && (a & 0xFFFE) <= 0xFFFC, 1)) {
+            typedef uint32_t Alias32 __attribute__((may_alias, aligned(2)));
+            return *reinterpret_cast<const Alias32 *>(&c.ram[a & 0xFFFE]);
+        }
+        return SlowR32(c, a);
+    }
+    DDSOM_ACCESS void FastW8(M68K &c, uint32_t a, uint32_t v) {
+        if (__builtin_expect((a & 0xFFFFFF) >= 0xFF0000, 1)) {
+            WRITE_HASH(c, a & 0xFFFFFF, v);
+            c.ram[a & 0xFFFF] = static_cast<uint8_t>(v);
+            return;
+        }
+        SlowW8(c, a, v);
+    }
+    DDSOM_ACCESS void FastW16(M68K &c, uint32_t a, uint32_t v) {
+        if (__builtin_expect((a & 0xFFFFFF) >= 0xFF0000, 1)) {
+            WRITE_HASH(c, a & 0xFFFFFE, v);
+            typedef uint16_t Alias __attribute__((may_alias));
+            *reinterpret_cast<Alias *>(&c.ram[a & 0xFFFE]) = static_cast<uint16_t>(v);
+            return;
+        }
+        SlowW16(c, a, v);
+    }
+    DDSOM_ACCESS void FastW32(M68K &c, uint32_t a, uint32_t v) {
+        if (__builtin_expect((a & 0xFFFFFF) >= 0xFF0000 && (a & 0xFFFE) <= 0xFFFC, 1)) {
+            WRITE_HASH(c, a & 0xFFFFFE, v);
+            typedef uint32_t Alias32 __attribute__((may_alias, aligned(2)));
+            *reinterpret_cast<Alias32 *>(&c.ram[a & 0xFFFE]) = v;
+            return;
+        }
+        SlowW32(c, a, v);
+    }
+    DDSOM_ACCESS uint32_t FastP32(M68K &c, uint32_t a) {
+        a &= 0xFFFFFE;
+        if (__builtin_expect((a >> RomCache::kPageBits) == g_romOpcodes.lastPage &&
+                             (a & (RomCache::kPage - 1)) <= RomCache::kPage - 4, 1)) {
+            typedef uint32_t Alias32 __attribute__((may_alias, aligned(2)));
+            return *reinterpret_cast<const Alias32 *>(g_romOpcodes.lastBase + (a & (RomCache::kPage - 1)));
+        }
+        return SlowP32(c, a);
+    }
+#ifndef DDSOM_NO_ACCESS_MACROS // (arquivos com funcoes proprias desses nomes, como rdp_video.cpp, pedem para ficar de fora)
+#define R8(c, a) FastR8(c, a)
+#define R16(c, a) FastR16(c, a)
+#define R32(c, a) FastR32(c, a)
+#define W8(c, a, v) FastW8(c, a, v)
+#define W16(c, a, v) FastW16(c, a, v)
+#define W32(c, a, v) FastW32(c, a, v)
+#define P32(c, a) FastP32(c, a)
+#endif
+#endif
 
     inline uint32_t S8(uint32_t value) {
         return static_cast<uint32_t>(static_cast<int8_t>(value));

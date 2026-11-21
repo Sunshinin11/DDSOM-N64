@@ -3,10 +3,15 @@
 
 #include "cart_n64.h"
 #include "lift.h"
+#include "lift_sprites.h"
+#include "native.h"
 
 #include <cstring>
 
 namespace cps2recomp {
+#if defined(CPS2RECOMP_N64) && defined(DDSOM_TASK_DUMP)
+bool g_ddsomTaskDump = false; // (main.cpp liga nos quadros da janela de medicao)
+#endif
 
 namespace {
     // Um frame da placa: 262 linhas de 1024 ciclos do 68000; o vblank comeca na linha 240
@@ -85,6 +90,20 @@ namespace {
     }
     bool PassStarts(M68K &c) {
         auto& b=static_cast<NativeBoard&>(c.bus);
+#if defined(CPS2RECOMP_N64) && defined(DDSOM_TASK_DUMP)
+        // (medicao: um quadro que ja deu 30 passadas no escalonador sem ficar ocioso: o estado das 16 tarefas)
+        if (g_ddsomTaskDump && b.passRun == 30) {
+            auto lw=[](const uint8_t*p){return uint32_t(p[0])<<24|uint32_t(p[1])<<16|uint32_t(p[2])<<8|p[3];};
+            debugf("[DDSOM_TASKS] a5=%06lx ffd0=%04x g30=%02x g33=%02x", (unsigned long)c.a[5], Word(b.ram+0xffd0), b.ram[0x8030], b.ram[0x8033]);
+            for (unsigned i = 0; i < 16; i++) {
+                const uint8_t *p = b.ram + 0x64 + i * 16; if (p[0] < 4) continue;
+                const uint32_t stack = lw(p + 8);
+                debugf(" t%u:s%u pc=%06lx ret=%06lx", i, p[0], (unsigned long)lw(p + 4),
+                       (unsigned long)((stack >= 0xff0000 && stack <= 0xffffbf) ? lw(b.ram + (stack & 65535) + 60) : 0));
+            }
+            debugf("\n");
+        }
+#endif
         if(b.optimizePolling&&RepeatsItself(c,b)){
             b.pollSkipped++;
             c.cycles=c.budget;
@@ -105,6 +124,98 @@ namespace {
         b.schedulerWorked = true;
         return false;
     }
+    // The N64 mixer is initialized before the game starts. Continue directly
+    // into the game's memory initialization, with the boot routine's outputs.
+    bool SoundInitialized(M68K &c) {
+        c.flagN = c.flagV = c.flagC = false;
+        c.flagZ = true;
+        c.a[0] = 0x618000;
+        c.a[1] = 0x61A000;
+        c.a[2] = 0x0019E0;
+        c.a[6] = 0x00190A;
+        c.pc = 0x001950;
+        return true;
+    }
+
+    // Entry 0006C4 is reached only after the game has selected an occupied
+    // entry in its own sound queue and checked that the previous one is done.
+    bool SubmitSound(M68K &c) {
+        auto &board = static_cast<NativeBoard &>(c.bus);
+        if (board.soundRam[0xFFD] != 0x88 ||
+            board.soundWrite - board.soundRead == NativeBoard::kSoundQueue) {
+            return false;
+        }
+        constexpr uint8_t order[] = {3, 4, 0, 1, 6, 7, 8, 9, 10, 11, 12};
+        uint8_t packet[16];
+        memcpy(packet, board.soundRam, sizeof packet);
+        for (unsigned i = 0; i < sizeof order; ++i) {
+            const auto index = order[i];
+            packet[index] = board.Read8(c.a[4] + i + (i >= 4));
+            WRITE_HASH(c, 0x618001 + 2 * index, packet[index]);
+        }
+        WRITE_HASH(c, 0x61801F, 0);
+        packet[15] = 0;
+        memcpy(board.soundQueue[board.soundWrite++ % NativeBoard::kSoundQueue], packet, sizeof packet);
+        memcpy(board.lastSoundRequest, packet, sizeof packet);
+        ++board.soundRequests;
+        // The service menu still reads these fields to display its last request.
+        packet[15] = 0xFF;
+        memcpy(board.soundRam, packet, sizeof packet);
+        c.a[4] += 12;
+        const unsigned next = (c.d[0] + 16) & 0x3F0;
+        const uint32_t cursor = c.a[5] - 0x56A4;
+        board.Write16(cursor, next);
+        WRITE_HASH(c, cursor, next);
+        c.d[0] = (c.d[0] & 0xFFFF0000) | next;
+        c.flagN = c.flagV = c.flagC = c.flagX = false;
+        c.flagZ = next == 0;
+        c.pc = 0x00071C;
+        return true;
+    }
+
+    template <bool Write>
+    bool TransferSave(M68K &c) {
+        auto &board = static_cast<NativeBoard &>(c.bus);
+        const uint32_t base = c.a[5];
+        const auto offset = static_cast<int16_t>(board.Read16(base - 0x6168));
+        const unsigned words = unsigned(board.Read16(base - 0x616C)) + 1;
+        const unsigned first = (static_cast<uint16_t>(offset) >> 1) & 63;
+        uint32_t data = (uint32_t(board.Read16(base - 0x6172)) << 16) |
+                        board.Read16(base - 0x6170);
+        data += offset;
+        uint16_t value = 0;
+        for (unsigned i = 0; i < words; ++i, data += 2) {
+            auto &word = board.eeprom.words[(first + i) & 63];
+            if constexpr (Write) {
+                value = word = board.Read16(data);
+            } else {
+                value = word;
+                board.Write16(data, value);
+                WRITE_HASH(c, data, value);
+            }
+        }
+        board.Write8(base + 0x74, 0);
+        WRITE_HASH(c, base + 0x74, 0);
+        c.a[6] = data;
+        c.d[3] = Write ? c.d[3] | 0xFFFF : 0xFFFF;
+        c.d[5] |= 0xFFFF;
+        c.d[4] = (c.d[4] & 0xFFFF0000) |
+                 (Write ? (0x140 | ((first + words - 1) & 63)) + 1 : (0x180 | first) + words);
+        c.d[2] = (Write ? value & 1 : (first + words - 1) & 1) << 12;
+        c.flagN = c.flagV = c.flagC = c.flagX = false;
+        c.flagZ = true;
+        if constexpr (Write) {
+            board.eeprom.changed = true;
+            c.d[0] = 0;
+            c.d[1] = 0x2FFFE;
+        } else {
+            c.d[0] = value;
+            c.d[1] = (c.d[1] & 0xFFFF0000) | (value & 1);
+        }
+        c.pc = c.Pop32();
+        return true;
+    }
+
     bool g_hooksAdded = false;
 } // namespace
 
@@ -114,12 +225,23 @@ NativeBoard::NativeBoard() {
 
 void NativeBoard::Reset() {
     if (!g_hooksAdded) {
+#if defined(CPS2RECOMP_N64) || defined(DDSOM_DIRECT_AUDIO_TEST)
+        AddHook(0x0006C4, "SubmitSound", SubmitSound);
+        AddHook(0x0018E2, "SoundInitialized", SoundInitialized);
+#endif
+#if defined(CPS2RECOMP_N64) || defined(DDSOM_DIRECT_SAVE_TEST)
+        AddHook(0x02D846, "ReadSettings", TransferSave<false>);
+        AddHook(0x02D90E, "WriteSettings", TransferSave<true>);
+#endif
         AddHook(0x000932, "SchedulerPass", PassStarts);
         AddHook(0x000960, "SchedulerTask", TaskRuns);
+        RegisterSpriteRewrite();
         g_hooksAdded = true;
     }
     memset(ram, 0, sizeof(ram));
     memset(videoRam, 0, sizeof(videoRam));
+    memset(native::g_videoDirty, 255, sizeof(native::g_videoDirty));
+    palettePagesChanged = 0x3F;
     memset(objectRam, 0, sizeof(objectRam));
     memset(extraRam, 0, sizeof(extraRam));
     memset(soundRam, 0, sizeof(soundRam));
@@ -142,6 +264,8 @@ void NativeBoard::Reset() {
     cpu.ram = ram;
     cpu.video = videoRam;
     cpu.videoSize = sizeof(videoRam);
+    cpu.extra = extraRam;
+    cpu.objWrite = objectRam[objectBank ^ 1];
     cpu.rom = program;
     cpu.opcodes = opcodes;
     cpu.romSize = programSize;
@@ -153,7 +277,10 @@ void NativeBoard::Reset() {
 }
 
 void NativeBoard::CaptureSound(){
- if(soundRam[0x00F]==0xFF||soundRam[0xFFF]!=0x77||soundRam[0xFFD]!=0x88)return;
+ if(soundRam[0x00F]==0xFF||soundRam[0xFFD]!=0x88)return;
+#if !defined(CPS2RECOMP_N64) && !defined(DDSOM_DIRECT_AUDIO_TEST)
+ if(soundRam[0xFFF]!=0x77)return;
+#endif
  if(soundWrite-soundRead==kSoundQueue){soundOverflows++;return;}
  memcpy(soundQueue[soundWrite++%kSoundQueue],soundRam,16);
  memcpy(lastSoundRequest,soundRam,16);soundRequests++;soundRam[0x00F]=0xFF;
@@ -242,10 +369,20 @@ uint16_t NativeBoard::Input(int port) const {
                                         ((p3 & kPadStart) ? 0x0400 : 0) | ((p4 & kPadStart) ? 0x0800 : 0) |
                                         ((p1 & kPadCoin) ? 0x1000 : 0) | ((p2 & kPadCoin) ? 0x2000 : 0) |
                                         ((p3 & kPadCoin) ? 0x4000 : 0) | ((p4 & kPadCoin) ? 0x8000 : 0));
+#ifdef CPS2RECOMP_N64
+        return static_cast<uint16_t>(~pressed);
+#else
         return static_cast<uint16_t>((~pressed & 0xFFFE) | (eeprom.DataOut() ? 1 : 0));
+#endif
     }
     return static_cast<uint16_t>(~pressed);
 }
+
+#ifdef CPS2RECOMP_N64
+uint16_t ReadNativeJoypad(M68K &c, unsigned port) {
+    return static_cast<const NativeBoard &>(c.bus).Input(port);
+}
+#endif
 
 // --- leituras ---
 uint16_t NativeBoard::Fetch16(uint32_t address) {
@@ -313,6 +450,7 @@ void NativeBoard::Write16(uint32_t address, uint16_t value) {
     if (address >= 0xFF0000) {
         SetWord(&ram[address & 0xFFFE], value);
     } else if (address >= 0x900000 && address < 0x930000) {
+        native::g_videoDirty[(address - 0x900000) >> 8] = 255;
         SetWord(&videoRam[address - 0x900000], value);
     } else {
         WriteRegister(address, value, 0xFFFF);
@@ -323,6 +461,7 @@ void NativeBoard::Write8(uint32_t address, uint8_t value) {
     if (address >= 0xFF0000) {
         ram[address & 0xFFFF] = value;
     } else if (address >= 0x900000 && address < 0x930000) {
+        native::g_videoDirty[(address - 0x900000) >> 8] = 255;
         videoRam[address - 0x900000] = value;
     } else if (address & 1) {
         WriteRegister(address & ~1u, value, 0x00FF);
@@ -338,14 +477,26 @@ void NativeBoard::TakePalette() {
     const uint16_t control = cpsB[0x30 / 2];
     uint32_t at = base;
     bool changed = false;
+#if defined(CPS2RECOMP_N64) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+    // Uma pagina cuja origem o jogo nao escreveu desde a ultima copia (blocos de 256 bytes de g_videoDirty, bit 0x10),
+    // com a mesma base e o mesmo controle, nao precisa nem ser comparada (comparar as 6 paginas lia ~12 KB por vez)
+    static uint32_t lastBase = UINT32_MAX;
+    static uint16_t lastControl = 0;
+    const bool sameSource = base == lastBase && control == lastControl;
+    lastBase = base; lastControl = control;
+#endif
     for (int page = 0; page < 6; page++) {
         if (control & (1u << page)) {
 #if defined(CPS2RECOMP_N64) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
             // (a page never crosses the end of the video RAM; the game writes the same palette again and again,
             // and only a different one is a change for the renderer)
-            if (!SameWords(&palette[0x200 * page], &videoRam[at & 0x3FFFF], 0x400)) {
+            uint8_t *dirty = &native::g_videoDirty[(at & 0x3FFFF) >> 8];
+            const bool written = (dirty[0] | dirty[1] | dirty[2] | dirty[3]) & 0x10;
+            dirty[0] &= ~0x10; dirty[1] &= ~0x10; dirty[2] &= ~0x10; dirty[3] &= ~0x10;
+            if ((written || !sameSource) && !SameWords(&palette[0x200 * page], &videoRam[at & 0x3FFFF], 0x400)) {
                 memcpy(&palette[0x200 * page], &videoRam[at & 0x3FFFF], 0x400);
                 changed = true;
+                palettePagesChanged |= static_cast<uint8_t>(1u << page);
             }
             at += 0x400;
 #else
@@ -362,6 +513,9 @@ void NativeBoard::TakePalette() {
     }
     if (changed) {
         paletteChanged = true;
+#if !(defined(CPS2RECOMP_N64) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__)
+        palettePagesChanged = 0x3F; // (aqui sem o controle por pagina)
+#endif
     }
 }
 
@@ -413,16 +567,19 @@ void NativeBoard::WriteRegister(uint32_t address, uint16_t value, uint16_t mask)
         return;
     }
     if (address == 0x804040) {
+#ifndef CPS2RECOMP_N64
         if (mask & 0xFF00) {
             eeprom.SetLines(value & 0x4000, value & 0x2000, value & 0x1000);
         }
         if ((mask & 0x00FF) && (value & 0x0008)) {
-            soundRam[0xFFF] = 0x77; // (o jogo liga o lado do som e espera o "pronto" do driver da Capcom em 619FFF)
+            soundRam[0xFFF] = 0x77; // Guest driver status in the host reference.
         }
+#endif
         return; // (o resto do byte baixo: contadores de ficha)
     }
     if (address == 0x8040E0 && (mask & 0x00FF)) {
         objectBank = value & 1;
+        cpu.objWrite = objectRam[objectBank ^ 1];
     }
 }
 
